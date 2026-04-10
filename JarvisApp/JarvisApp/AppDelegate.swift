@@ -266,46 +266,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Menu actions
 
     @objc private func toggleMute() {
-        isMuted.toggle()
-
-        if let muteItem = statusItem?.menu?.item(withTag: 200) {
-            muteItem.title = isMuted ? "Unmute" : "Mute"
+        Task { @MainActor in
+            self.isMuted.toggle()
+            if let item = self.statusItem?.menu?.item(withTag: 200) {
+                item.title = self.isMuted ? "Unmute" : "Mute"
+            }
+            guard let url = URL(string: "http://localhost:3000/api/mute") else { return }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try? JSONSerialization.data(withJSONObject: ["muted": self.isMuted])
+            _ = try? await URLSession.shared.data(for: request)
         }
-
-        // POST to the mute API (ws_server.py expects POST with JSON body)
-        guard let url = URL(string: "http://localhost:3000/api/mute") else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["muted": isMuted])
-        URLSession.shared.dataTask(with: request).resume()
     }
 
     @objc private func restartJarvis() {
-        backendManager.restart()
+        Task { @MainActor in
+            self.backendManager.restart()
+        }
     }
 
     @objc private func showLogs() {
-        if let w = logsWindow {
-            w.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
+        if logsWindow == nil {
+            let logsView = LogsView().environmentObject(backendManager)
+            let hosting = NSHostingView(rootView: logsView)
+            hosting.frame = NSRect(x: 0, y: 0, width: 700, height: 400)
 
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 700, height: 400),
-            styleMask: [.titled, .closable, .resizable, .miniaturizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Jarvis — Logs"
-        window.contentView = NSHostingView(
-            rootView: LogsView().environmentObject(backendManager)
-        )
-        window.center()
-        window.makeKeyAndOrderFront(nil)
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 700, height: 400),
+                styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "Jarvis — Logs"
+            window.contentView = hosting
+            window.center()
+            window.isReleasedWhenClosed = false
+            logsWindow = window
+        }
+        logsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        logsWindow = window
     }
 
     // MARK: - Microphone
