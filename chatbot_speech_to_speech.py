@@ -871,11 +871,13 @@ class VoiceAssistant:
             return "Screenshot saved to your Desktop, Sir."
 
         # ── Timer (flexible phrasing + word numbers) ─────────────────────────
-        # Matches: "set a 15 second timer", "timer for 2 minutes",
+        # Matches: "set a 15 second timer", "at a 10-second timer",
         # "5 minute timer", "start a 10 second timer", "give me 5 minutes",
-        # "give me two minutes", "give me an hour"
+        # "give me two minutes", "give me an hour", "put a 2 minute timer",
+        # "can you set a 5 minute timer"
         _NUM = r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|thirty|forty[\s-]?five|sixty)"
         _UNIT = r"(second|minute|hour)s?"
+        _SEP = r"[\s\-]+"  # space or hyphen between number and unit
 
         # "give me an hour" / "give me a minute"
         m_give_an = re.search(r"\bgive\s+me\s+(?:an?\s+)" + _UNIT + r"\b", t)
@@ -888,7 +890,7 @@ class VoiceAssistant:
             return f"Timer set for 1 {unit}, Sir."
 
         # "give me 5 minutes" / "give me two minutes"
-        m_give = re.search(r"\bgive\s+me\s+" + _NUM + r"\s*" + _UNIT + r"\b", t)
+        m_give = re.search(r"\bgive\s+me\s+" + _NUM + _SEP + _UNIT + r"\b", t)
         if m_give:
             amount = self._parse_number(m_give.group(1))
             unit = m_give.group(2)
@@ -900,13 +902,15 @@ class VoiceAssistant:
                 ).start()
                 return f"Timer set for {label}, Sir."
 
-        # "timer for 5 minutes" / "set a 15 second timer" / "5 minute timer"
+        # "timer for 5 minutes" / "set a 15 second timer" / "at a 10-second timer"
+        # "put a 2 minute timer" / "can you set a 5 minute timer"
+        _TIMER_PREFIX = r"(?:(?:can\s+you\s+)?(?:set|at|put|start)\s+(?:a\s+)?)?"
         m_timer = re.search(
-            r"\b(?:set\s+(?:a\s+)?|start\s+(?:a\s+)?)?timer\s+(?:for\s+)?" + _NUM + r"\s*" + _UNIT + r"\b", t
+            r"\b" + _TIMER_PREFIX + r"timer\s+(?:for\s+)?" + _NUM + _SEP + _UNIT + r"\b", t
         )
         if not m_timer:
             m_timer = re.search(
-                r"\b(?:set\s+(?:a\s+)?|start\s+(?:a\s+)?)?" + _NUM + r"\s*" + _UNIT + r"\s+timer\b", t
+                r"\b" + _TIMER_PREFIX + _NUM + _SEP + _UNIT + r"\s+timer\b", t
             )
         if m_timer:
             amount = self._parse_number(m_timer.group(1))
