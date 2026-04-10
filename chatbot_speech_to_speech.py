@@ -63,7 +63,7 @@ PLAYER_BLOCKSIZE = 4_096
 
 # ── Wake word ────────────────────────────────────────────────────────────────
 WAKE_WORD_MODEL = "hey_jarvis"
-WAKE_WORD_THRESHOLD = 0.5
+WAKE_WORD_THRESHOLD = 0.75
 CONVERSATION_TIMEOUT = 15.0
 WAKE_CHUNK_SIZE = 1280
 
@@ -652,6 +652,11 @@ class VoiceAssistant:
             score = prediction.get(WAKE_WORD_MODEL, 0)
             if score >= WAKE_WORD_THRESHOLD:
                 self._close_wake_stream()
+                # Reset model state to clear stale predictions
+                try:
+                    self._wake_model.reset()
+                except Exception:
+                    pass
                 return True
             return False
         except Exception:
@@ -699,7 +704,11 @@ class VoiceAssistant:
         self._cancel_conversation_timer()
         self._return_to_wake.set()
         ws_server.set_state("wake")
+        self._close_wake_stream()
         print("\n[WAKE] Returning to wake mode", flush=True)
+        # Drain audio and wait for residual TTS audio to clear
+        time.sleep(2.0)
+        self._drain_q()
 
     def _check_lang_switch(self) -> None:
         """Placeholder for future language-switching support."""
@@ -1316,6 +1325,8 @@ class VoiceAssistant:
                     # WAKE MODE: listen for wake word
                     detected = self._listen_for_wake_word()
                     if detected:
+                        self._drain_q()
+                        time.sleep(0.3)
                         self._in_conversation = True
                         self._return_to_wake.clear()
                         self._start_conversation_timer()
@@ -1413,7 +1424,8 @@ class VoiceAssistant:
                 self._cancel_conversation_timer()
                 self._cleanup_wake_word()
                 ws_server.set_state("idle")
-                break
+                time.sleep(0.3)  # Let ws_server broadcast the idle state
+                os._exit(0)      # Bypass Metal GPU cleanup to prevent crash
 
 
 if __name__ == "__main__":
