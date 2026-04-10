@@ -174,6 +174,7 @@ class VoiceAssistant:
             "Keep answers brief and conversational. No bullet points or markdown.",
         )
         self._stop_speak = threading.Event()
+        self._tts_speaking = False
         self.pending_confirmation: Optional[dict] = None
 
     # ── Loading ───────────────────────────────────────────────────────────────
@@ -313,6 +314,15 @@ class VoiceAssistant:
             while True:
                 if ws_server.is_muted():
                     return b""
+                if self._tts_speaking:
+                    # Discard all incoming audio while Jarvis is speaking
+                    try:
+                        self._audio_q.get_nowait()
+                    except queue.Empty:
+                        time.sleep(0.01)
+                    speaking = False
+                    buf = b""
+                    continue
                 frame = self._audio_q.get()
                 if self.vad.is_speech(frame, SAMPLE_RATE):
                     if not speaking:
@@ -365,6 +375,7 @@ class VoiceAssistant:
 
     def speak_direct(self, text: str) -> None:
         """Speak text immediately via TTS — no LLM involved."""
+        self._tts_speaking = True
         ws_server.set_state("speaking")
         try:
             wav    = self._synthesise(text)
@@ -374,6 +385,9 @@ class VoiceAssistant:
             player.mark_done()
             player.wait()
         finally:
+            time.sleep(0.3)
+            self._drain_q()
+            self._tts_speaking = False
             ws_server.set_state("idle")
 
     def stop_speaking(self) -> None:
