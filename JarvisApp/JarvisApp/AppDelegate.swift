@@ -1,259 +1,316 @@
 import AppKit
 import SwiftUI
+import WebKit
 import AVFoundation
-import AVFAudio
+
+// MARK: - Animated menubar waveform icon
+
+final class WaveformIconView: NSView {
+
+    private let barColor = NSColor(red: 0.0, green: 0.706, blue: 1.0, alpha: 1.0)
+    private let barWidth: CGFloat  = 3
+    private let barGap: CGFloat    = 3
+    private let idleHeights: [CGFloat] = [6, 10, 6]
+
+    private var barHeights: [CGFloat] = [6, 10, 6]
+    private var phase: Double = 0
+    private var animTimer: Timer?
+
+    override var isFlipped: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        barColor.setFill()
+        let totalWidth = 3 * barWidth + 2 * barGap   // 15
+        let startX = (bounds.width - totalWidth) / 2
+
+        for i in 0..<3 {
+            let h = barHeights[i]
+            let x = startX + CGFloat(i) * (barWidth + barGap)
+            let y = (bounds.height - h) / 2
+            let rect = NSRect(x: x, y: y, width: barWidth, height: h)
+            NSBezierPath(roundedRect: rect, xRadius: 1.5, yRadius: 1.5).fill()
+        }
+    }
+
+    func startAnimating() {
+        guard animTimer == nil else { return }
+        animTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.phase += 0.15
+            self.barHeights = [
+                7 + 6 * sin(self.phase),
+                7 + 6 * sin(self.phase + 1.0),
+                7 + 6 * sin(self.phase + 2.0),
+            ]
+            self.needsDisplay = true
+        }
+    }
+
+    func stopAnimating() {
+        animTimer?.invalidate()
+        animTimer = nil
+        barHeights = idleHeights
+        phase = 0
+        needsDisplay = true
+    }
+}
+
+// MARK: - WKWebView wrapper for the orb
+
+struct WKWebViewRepresentable: NSViewRepresentable {
+
+    func makeNSView(context: Context) -> JarvisWebView {
+        let config = WKWebViewConfiguration()
+        config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
+
+        let webView = JarvisWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        webView.allowsMagnification = false
+
+        if let url = URL(string: "http://localhost:3000") {
+            webView.load(URLRequest(url: url))
+        }
+        return webView
+    }
+
+    func updateNSView(_ nsView: JarvisWebView, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        func webView(_ webView: WKWebView,
+                     decidePolicyFor action: WKNavigationAction,
+                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            let host = action.request.url?.host ?? ""
+            if host == "localhost" || host == "127.0.0.1" || action.navigationType == .other {
+                decisionHandler(.allow)
+            } else {
+                decisionHandler(.cancel)
+            }
+        }
+    }
+}
+
+/// Custom WKWebView: allows dragging the window by its background, suppresses context menu.
+final class JarvisWebView: WKWebView {
+    override var mouseDownCanMoveWindow: Bool { true }
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        menu.removeAllItems()
+    }
+}
+
+// MARK: - Orb content (SwiftUI view that observes BackendManager)
+
+struct OrbContentView: View {
+    @EnvironmentObject var backend: BackendManager
+
+    var body: some View {
+        ZStack {
+            Color.black
+            WKWebViewRepresentable()
+            VStack {
+                Spacer()
+                HStack {
+                    Spacer()
+                    STTOverlay(text: backend.lastSTT)
+                        .padding(.trailing, 14)
+                        .padding(.bottom, 14)
+                }
+            }
+        }
+        .frame(width: 420, height: 420)
+    }
+}
+
+// MARK: - AppDelegate
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
     let backendManager = BackendManager()
-    private var logsWindow: NSWindow?
-    /// Run the mic flow once; wait for a SwiftUI window so the system permission sheet can attach.
-    private var didScheduleMicrophoneFlow = false
-    /// Einmaliger Warmup, damit TCC / Mikrofon-Gerät wirklich angebunden wird (nicht nur requestAccess).
-    private var didRunMicCaptureWarmup = false
 
-    // MARK: - NSApplicationDelegate
+    private var statusItem: NSStatusItem?
+    private var orbWindow: NSPanel?
+    private var logsWindow: NSWindow?
+    private var waveformView = WaveformIconView(frame: NSRect(x: 0, y: 0, width: 28, height: 18))
+    private var isMuted = false
+    private var phaseTimer: Timer?
+
+    // MARK: - Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.activate(ignoringOtherApps: true)
-        configureMainWindow()
-    }
-
-    func applicationDidBecomeActive(_ notification: Notification) {
-        guard !didScheduleMicrophoneFlow else { return }
-        didScheduleMicrophoneFlow = true
-        waitForWindowThenRequestMicrophone(retry: 0)
-    }
-
-    private func waitForWindowThenRequestMicrophone(retry: Int) {
-        if NSApp.windows.isEmpty, retry < 40 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                self.waitForWindowThenRequestMicrophone(retry: retry + 1)
-            }
-            return
-        }
-        DispatchQueue.main.async {
-            self.configureMainWindow()
-            // Python sofort; Mikrofon kurz verzögert, damit das System-Sheet nicht hinter dem Fenster hängt.
-            self.backendManager.start()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                self.requestMicrophoneAccess()
-                // Async-Callbacks von requestAccess können später feuern — nochmal prüfen.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                    self.runMicCaptureWarmupIfAuthorized(reason: "verzögert nach Berechtigungs-Callbacks")
-                }
-            }
-        }
+        NSApp.setActivationPolicy(.accessory)
+        setupMenubar()
+        setupOrbWindow()
+        backendManager.start()
+        startPhaseObserver()
+        requestMicrophonePermission()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        phaseTimer?.invalidate()
         backendManager.stop()
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+    // MARK: - Menubar
+
+    private func setupMenubar() {
+        statusItem = NSStatusBar.system.statusItem(withLength: 28)
+
+        if let button = statusItem?.button {
+            waveformView.frame = NSRect(
+                x: (button.bounds.width - 28) / 2,
+                y: (button.bounds.height - 18) / 2,
+                width: 28,
+                height: 18
+            )
+            button.addSubview(waveformView)
+        }
+
+        let menu = NSMenu()
+
+        let titleItem = NSMenuItem(title: "Jarvis", action: nil, keyEquivalent: "")
+        titleItem.attributedTitle = NSAttributedString(
+            string: "Jarvis",
+            attributes: [.font: NSFont.boldSystemFont(ofSize: 13)]
+        )
+        titleItem.isEnabled = false
+        menu.addItem(titleItem)
+
+        menu.addItem(.separator())
+
+        let statusItem = NSMenuItem(title: "● Idle", action: nil, keyEquivalent: "")
+        statusItem.tag = 100
+        statusItem.isEnabled = false
+        menu.addItem(statusItem)
+
+        menu.addItem(.separator())
+
+        let muteItem = NSMenuItem(title: "Mute", action: #selector(toggleMute), keyEquivalent: "")
+        muteItem.tag = 200
+        muteItem.target = self
+        menu.addItem(muteItem)
+
+        let restartItem = NSMenuItem(title: "Restart Jarvis", action: #selector(restartJarvis), keyEquivalent: "")
+        restartItem.target = self
+        menu.addItem(restartItem)
+
+        let logsItem = NSMenuItem(title: "Show Logs", action: #selector(showLogs), keyEquivalent: "")
+        logsItem.target = self
+        menu.addItem(logsItem)
+
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "Quit Jarvis", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quitItem)
+
+        self.statusItem?.menu = menu
     }
 
-    // MARK: - Microphone permission
-    //
-    // • AVCaptureDevice: klassischer Eintrag unter Datenschutz → Mikrofon.
-    // • AVAudioApplication (macOS 14+): Zuordnung für Audio/Unterprozesse (Python + sounddevice).
+    // MARK: - Orb window
 
-    private func requestMicrophoneAccess() {
-        NSApp.activate(ignoringOtherApps: true)
-        let front = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first
-        front?.makeKeyAndOrderFront(nil)
-        NSApp.requestUserAttention(.informationalRequest)
+    private func setupOrbWindow() {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 420),
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .floating
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.isMovableByWindowBackground = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
-        let cap = AVCaptureDevice.authorizationStatus(for: .audio)
-        backendManager.appendLog("[Mic] AVCapture (Mikrofon): \(Self.describeCaptureStatus(cap))\n")
+        // Position bottom-right of screen
+        if let screen = NSScreen.main?.visibleFrame {
+            panel.setFrameOrigin(NSPoint(x: screen.maxX - 440, y: screen.minY + 20))
+        }
 
-        if #available(macOS 14.0, *) {
-            let rec = AVAudioApplication.shared.recordPermission
-            backendManager.appendLog("[Mic] AVAudioApplication (Aufnahme): \(Self.describeRecordPermission(rec))\n")
-            if cap == .denied || cap == .restricted || rec == .denied {
-                backendManager.appendLog("[Mic] Verweigert — kein System-Dialog mehr; Einstellungen oder tccutil reset.\n")
-                presentMicDeniedNeedsSettingsAlert()
-                return
-            }
-            if rec == .undetermined {
-                backendManager.appendLog("[Mic] Fordere AVAudioApplication.requestRecordPermission an …\n")
-                AVAudioApplication.requestRecordPermission { granted in
-                    DispatchQueue.main.async {
-                        self.backendManager.appendLog("[Mic] AVAudioApplication Ergebnis: \(granted ? "erlaubt" : "abgelehnt")\n")
-                        self.runMicCaptureWarmupIfAuthorized(reason: "nach AVAudioApplication")
-                    }
+        let orbContent = OrbContentView()
+            .environmentObject(backendManager)
+
+        panel.contentView = NSHostingView(rootView: orbContent)
+        orbWindow = panel
+        panel.orderFrontRegardless()
+    }
+
+    // MARK: - Phase observer
+
+    private func startPhaseObserver() {
+        phaseTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let menu = self.statusItem?.menu
+                let statusMenuItem = menu?.item(withTag: 100)
+
+                switch self.backendManager.phase {
+                case .idle:
+                    self.waveformView.stopAnimating()
+                    statusMenuItem?.title = "● Idle"
+                case .starting:
+                    self.waveformView.stopAnimating()
+                    statusMenuItem?.title = "● Starting…"
+                case .ready:
+                    self.waveformView.startAnimating()
+                    statusMenuItem?.title = "● Ready"
+                case .failed:
+                    self.waveformView.stopAnimating()
+                    statusMenuItem?.title = "● Error"
                 }
             }
-            if cap == .notDetermined {
-                backendManager.appendLog("[Mic] Fordere AVCaptureDevice.requestAccess(audio) an …\n")
-                AVCaptureDevice.requestAccess(for: .audio) { granted in
-                    DispatchQueue.main.async {
-                        self.backendManager.appendLog("[Mic] AVCapture Ergebnis: \(granted ? "erlaubt" : "abgelehnt")\n")
-                        self.runMicCaptureWarmupIfAuthorized(reason: "nach AVCapture requestAccess")
-                    }
-                }
-            } else if cap == .authorized {
-                runMicCaptureWarmupIfAuthorized(reason: "AVCapture war schon authorized")
-            }
+        }
+    }
+
+    // MARK: - Menu actions
+
+    @objc private func toggleMute() {
+        isMuted.toggle()
+
+        if let muteItem = statusItem?.menu?.item(withTag: 200) {
+            muteItem.title = isMuted ? "Unmute" : "Mute"
+        }
+
+        // POST to the mute API (ws_server.py expects POST with JSON body)
+        guard let url = URL(string: "http://localhost:3000/api/mute") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["muted": isMuted])
+        URLSession.shared.dataTask(with: request).resume()
+    }
+
+    @objc private func restartJarvis() {
+        backendManager.restart()
+    }
+
+    @objc private func showLogs() {
+        if let w = logsWindow {
+            w.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
             return
         }
 
-        switch cap {
-        case .authorized:
-            runMicCaptureWarmupIfAuthorized(reason: "AVCapture war schon authorized")
-        case .notDetermined:
-            backendManager.appendLog("[Mic] Fordere AVCaptureDevice.requestAccess(audio) an …\n")
-            AVCaptureDevice.requestAccess(for: .audio) { granted in
-                DispatchQueue.main.async {
-                    self.backendManager.appendLog("[Mic] AVCapture Ergebnis: \(granted ? "erlaubt" : "abgelehnt")\n")
-                    self.runMicCaptureWarmupIfAuthorized(reason: "nach AVCapture requestAccess")
-                }
-            }
-        case .denied, .restricted:
-            backendManager.appendLog("[Mic] Verweigert — kein System-Dialog mehr.\n")
-            presentMicDeniedNeedsSettingsAlert()
-        @unknown default:
-            break
-        }
-    }
-
-    /// Kurz die Capture-Pipeline öffnen — triggert TCC/Zuordnung zuverlässiger als nur `requestAccess`.
-    private func runMicCaptureWarmupIfAuthorized(reason: String) {
-        guard !didRunMicCaptureWarmup else { return }
-        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else { return }
-        didRunMicCaptureWarmup = true
-        backendManager.appendLog("[Mic] Warmup (\(reason)): starte AVCaptureSession (~0,6 s) …\n")
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            let session = AVCaptureSession()
-            session.beginConfiguration()
-            if session.canSetSessionPreset(.medium) {
-                session.sessionPreset = .medium
-            }
-            guard let device = AVCaptureDevice.default(for: .audio) else {
-                DispatchQueue.main.async {
-                    self.backendManager.appendLog("[Mic] Warmup: kein Standard-Audiogerät.\n")
-                }
-                return
-            }
-            do {
-                let input = try AVCaptureDeviceInput(device: device)
-                guard session.canAddInput(input) else {
-                    DispatchQueue.main.async {
-                        self.backendManager.appendLog("[Mic] Warmup: canAddInput == false.\n")
-                    }
-                    return
-                }
-                session.addInput(input)
-            } catch {
-                DispatchQueue.main.async {
-                    self.backendManager.appendLog("[Mic] Warmup: \(error.localizedDescription)\n")
-                }
-                return
-            }
-            session.commitConfiguration()
-            session.startRunning()
-            Thread.sleep(forTimeInterval: 0.65)
-            session.stopRunning()
-            DispatchQueue.main.async {
-                self.backendManager.appendLog("[Mic] Warmup beendet — prüfe Datenschutz → Mikrofon auf „Jarvis“.\n")
-            }
-        }
-    }
-
-    private static func describeCaptureStatus(_ s: AVAuthorizationStatus) -> String {
-        switch s {
-        case .notDetermined: return "notDetermined (System-Dialog möglich)"
-        case .restricted:    return "restricted"
-        case .denied:        return "denied"
-        case .authorized:    return "authorized"
-        @unknown default:    return "unknown"
-        }
-    }
-
-    @available(macOS 14.0, *)
-    private static func describeRecordPermission(_ p: AVAudioApplication.recordPermission) -> String {
-        switch p {
-        case .undetermined: return "undetermined (System-Dialog möglich)"
-        case .denied:       return "denied"
-        case .granted:      return "granted"
-        @unknown default:   return "unknown"
-        }
-    }
-
-    // MARK: - Reset microphone permission
-
-    func resetMicrophonePermission() {
-        let confirm = NSAlert()
-        confirm.alertStyle      = .informational
-        confirm.messageText     = "Reset Microphone Permission?"
-        confirm.informativeText =
-            "This will clear Jarvis's microphone entry from System Settings so macOS " +
-            "asks you again on the next launch.\n\n" +
-            "Jarvis will quit automatically — just relaunch it and click Allow."
-        confirm.addButton(withTitle: "Reset & Quit")
-        confirm.addButton(withTitle: "Cancel")
-        guard confirm.runModal() == .alertFirstButtonReturn else { return }
-
-        let bundleID = Bundle.main.bundleIdentifier ?? ""
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
-        proc.arguments     = ["reset", "Microphone", bundleID]
-        try? proc.run()
-        proc.waitUntilExit()
-
-        NSApp.terminate(nil)
-    }
-
-    /// No system sheet possible anymore after deny — only Settings or `tccutil` reset.
-    private func presentMicDeniedNeedsSettingsAlert() {
-        let alert = NSAlert()
-        alert.alertStyle      = .warning
-        alert.messageText     = "Microphone Access Denied"
-        let bid = Bundle.main.bundleIdentifier ?? ""
-        alert.informativeText =
-            "macOS will not show the permission dialog again for Jarvis.\n\n" +
-            "Turn the switch on for Jarvis under Privacy & Security → Microphone, " +
-            "or use Jarvis → Reset Mic Permission…\n\n" +
-            "Terminal:  tccutil reset Microphone \(bid)"
-        alert.addButton(withTitle: "Open System Settings")
-        alert.addButton(withTitle: "Continue without Microphone")
-        if alert.runModal() == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(
-                URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
-        }
-    }
-
-    // MARK: - Window configuration
-
-    private func configureMainWindow() {
-        guard let window = NSApp.windows.first else { return }
-        window.minSize                     = NSSize(width: 400, height: 400)
-        window.titleVisibility             = .hidden
-        window.titlebarAppearsTransparent  = true
-        window.styleMask.insert(.fullSizeContentView)
-        window.isMovableByWindowBackground = true
-        window.setFrameAutosaveName("JarvisMainWindow")
-    }
-
-    // MARK: - Logs window
-
-    func showLogsWindow() {
-        if let w = logsWindow { w.makeKeyAndOrderFront(nil); return }
-        let controller = NSHostingController(
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 400),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Jarvis — Logs"
+        window.contentView = NSHostingView(
             rootView: LogsView().environmentObject(backendManager)
         )
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 480),
-            styleMask: [.titled, .closable, .resizable, .miniaturizable],
-            backing: .buffered, defer: false
-        )
-        window.title = "Jarvis — Backend Logs"
-        window.contentViewController = controller
         window.center()
         window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
         logsWindow = window
+    }
+
+    // MARK: - Microphone
+
+    private func requestMicrophonePermission() {
+        AVCaptureDevice.requestAccess(for: .audio) { _ in }
     }
 }

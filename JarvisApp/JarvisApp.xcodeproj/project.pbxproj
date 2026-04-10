@@ -28,8 +28,8 @@
 		AABBCCDD0000000000000018 /* LogsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogsView.swift; sourceTree = "<group>"; };
 		AABBCCDD000000000000001A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		AABBCCDD000000000000001B /* JarvisApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JarvisApp.entitlements; sourceTree = "<group>"; };
-		AABBCCDD000000000000001E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		AABBCCDD000000000000001C /* Jarvis.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Jarvis.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AABBCCDD000000000000001E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		AABBCCDD0000000000000040 /* chatbot_speech_to_speech.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; name = chatbot_speech_to_speech.py; path = ../../chatbot_speech_to_speech.py; sourceTree = "<group>"; };
 		AABBCCDD0000000000000042 /* ws_server.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; name = ws_server.py; path = ../../ws_server.py; sourceTree = "<group>"; };
 		AABBCCDD0000000000000044 /* config.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; name = config.json; path = ../../config.json; sourceTree = "<group>"; };
@@ -91,7 +91,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = AABBCCDD0000000000000004 /* Build configuration list for PBXNativeTarget "Jarvis" */;
 			buildPhases = (
-				AABBCCDD000000000000001D /* Check venv (Run Script) */,
+				AABBCCDD000000000000001D /* Check frontend dist (Run Script) */,
 				AABBCCDD0000000000000009 /* Sources */,
 				AABBCCDD000000000000000B /* Frameworks */,
 				AABBCCDD000000000000000A /* Resources */,
@@ -318,7 +318,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 9TGSRQR8N4;
+				DEVELOPMENT_TEAM = GVCGVNM4PS;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_EXPAND_BUILD_SETTINGS = YES;
@@ -348,7 +348,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 9TGSRQR8N4;
+				DEVELOPMENT_TEAM = GVCGVNM4PS;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_EXPAND_BUILD_SETTINGS = YES;

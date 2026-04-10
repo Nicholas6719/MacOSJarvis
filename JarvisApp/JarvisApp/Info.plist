@@ -28,8 +28,10 @@
 	<string>Local Jarvis Voice Assistant</string>
 	<!-- Required so macOS shows the microphone permission prompt for this app.
 	     The Python subprocess records audio, but TCC ties permission to the parent app. -->
+	<key>LSUIElement</key>
+	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Jarvis needs the microphone to hear your voice commands.</string>
+	<string>Jarvis needs microphone access to hear your voice commands.</string>
 
 	<!-- Allow plain HTTP/WS to localhost -->
 	<key>NSAppTransportSecurity</key>
