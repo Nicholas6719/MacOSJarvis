@@ -173,6 +173,7 @@ class VoiceAssistant:
             "Keep answers brief and conversational. No bullet points or markdown.",
         )
         self._stop_speak = threading.Event()
+        self._tts_speaking = False
         self.pending_confirmation: Optional[dict] = None
 
     # ── Loading ───────────────────────────────────────────────────────────────
@@ -282,6 +283,10 @@ class VoiceAssistant:
         Uses adaptive silence: short commands cut off at 600 ms,
         longer speech (> 2.5 s) gets 950 ms — so you can finish long sentences.
         """
+        # Wait until TTS finishes so the mic doesn't pick up Jarvis's own voice
+        while self._tts_speaking:
+            time.sleep(0.05)
+
         while ws_server.is_muted():
             ws_server.set_state("idle")
             time.sleep(0.1)
@@ -353,6 +358,7 @@ class VoiceAssistant:
 
     def speak_direct(self, text: str) -> None:
         """Speak text immediately via TTS — no LLM involved."""
+        self._tts_speaking = True
         ws_server.set_state("speaking")
         try:
             wav    = self._synthesise(text)
@@ -363,6 +369,7 @@ class VoiceAssistant:
             player.wait()
         finally:
             ws_server.set_state("idle")
+            self._tts_speaking = False
 
     def stop_speaking(self) -> None:
         self._stop_speak.set()
@@ -526,6 +533,21 @@ class VoiceAssistant:
     def _copy_to_clipboard(self, text: str) -> None:
         subprocess.run(["pbcopy"], input=text.encode(), check=False)
 
+    # Spoken word numbers → digits (used by timer & reminder parsing)
+    _WORD_NUMBERS: dict[str, int] = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "fifteen": 15, "twenty": 20, "thirty": 30,
+        "forty five": 45, "forty-five": 45, "sixty": 60,
+    }
+
+    def _parse_number(self, s: str) -> Optional[int]:
+        """Convert a string that is either digits or a spoken word number."""
+        s = s.strip().lower()
+        if s.isdigit():
+            return int(s)
+        return self._WORD_NUMBERS.get(s)
+
     def _timer_callback(self, seconds: int, label: str) -> None:
         time.sleep(seconds)
         msg = f"Sir, your {label} timer is up."
@@ -681,9 +703,10 @@ class VoiceAssistant:
         # ── Lock screen ───────────────────────────────────────────────────────
         if re.search(r"\block\s+(?:my\s+)?(?:mac|the\s+)?(?:screen|computer)\b", t):
             self.speak_direct("Locking your Mac, Sir.")
+            # Cmd+Ctrl+Q is the standard macOS lock-screen shortcut (Sequoia+)
             subprocess.run([
-                "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession",
-                "-suspend",
+                "osascript", "-e",
+                'tell application "System Events" to keystroke "q" using {command down, control down}',
             ], check=False)
             return None  # Already spoke before locking
 
@@ -848,33 +871,29 @@ class VoiceAssistant:
             subprocess.run(["screencapture", "-x", str(path)], check=False)
             return "Screenshot saved to your Desktop, Sir."
 
-        # ── Timer (FIX 3 — flexible phrasing) ─────────────────────────────────
+        # ── Timer (flexible phrasing + word numbers) ─────────────────────────
         # Matches: "set a 15 second timer", "timer for 2 minutes",
-        # "5 minute timer", "start a 10 second timer", "give me 5 minutes"
-        m = re.search(
-            r"\b(?:set\s+(?:a\s+)?|start\s+(?:a\s+)?)?(?:"
-            r"timer\s+(?:for\s+)?(\d+)\s*(second|minute|hour)s?"  # "timer for 5 minutes"
-            r"|(\d+)\s*(second|minute|hour)s?\s+timer"             # "5 minute timer"
-            r"|(?:set\s+(?:a\s+)?)?timer\s+(?:for\s+)?(\d+)\s*(second|minute|hour)s?"
-            r")\b", t
-        )
-        if not m:
-            m = re.search(r"\bgive\s+me\s+(\d+)\s*(second|minute|hour)s?\b", t)
-            if m:
-                amount = int(m.group(1))
-                unit = m.group(2)
-                seconds = amount * {"second": 1, "minute": 60, "hour": 3600}[unit]
-                label = f"{amount} {unit}{'s' if amount != 1 else ''}"
-                threading.Thread(
-                    target=self._timer_callback, args=(seconds, label), daemon=True
-                ).start()
-                return f"Timer set for {label}, Sir."
-        if m:
-            # Extract from whichever capture group matched
-            amount_str = m.group(1) or m.group(3) or m.group(5)
-            unit = m.group(2) or m.group(4) or m.group(6)
-            if amount_str and unit:
-                amount = int(amount_str)
+        # "5 minute timer", "start a 10 second timer", "give me 5 minutes",
+        # "give me two minutes", "give me an hour"
+        _NUM = r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|thirty|forty[\s-]?five|sixty)"
+        _UNIT = r"(second|minute|hour)s?"
+
+        # "give me an hour" / "give me a minute"
+        m_give_an = re.search(r"\bgive\s+me\s+(?:an?\s+)" + _UNIT + r"\b", t)
+        if m_give_an:
+            unit = m_give_an.group(1)
+            seconds = {"second": 1, "minute": 60, "hour": 3600}[unit]
+            threading.Thread(
+                target=self._timer_callback, args=(seconds, f"1 {unit}"), daemon=True
+            ).start()
+            return f"Timer set for 1 {unit}, Sir."
+
+        # "give me 5 minutes" / "give me two minutes"
+        m_give = re.search(r"\bgive\s+me\s+" + _NUM + r"\s*" + _UNIT + r"\b", t)
+        if m_give:
+            amount = self._parse_number(m_give.group(1))
+            unit = m_give.group(2)
+            if amount:
                 seconds = amount * {"second": 1, "minute": 60, "hour": 3600}[unit]
                 label = f"{amount} {unit}{'s' if amount != 1 else ''}"
                 threading.Thread(
@@ -882,7 +901,26 @@ class VoiceAssistant:
                 ).start()
                 return f"Timer set for {label}, Sir."
 
-        # ── Reminder (FIX 4 — flexible phrasing) ─────────────────────────────
+        # "timer for 5 minutes" / "set a 15 second timer" / "5 minute timer"
+        m_timer = re.search(
+            r"\b(?:set\s+(?:a\s+)?|start\s+(?:a\s+)?)?timer\s+(?:for\s+)?" + _NUM + r"\s*" + _UNIT + r"\b", t
+        )
+        if not m_timer:
+            m_timer = re.search(
+                r"\b(?:set\s+(?:a\s+)?|start\s+(?:a\s+)?)?" + _NUM + r"\s*" + _UNIT + r"\s+timer\b", t
+            )
+        if m_timer:
+            amount = self._parse_number(m_timer.group(1))
+            unit = m_timer.group(2)
+            if amount:
+                seconds = amount * {"second": 1, "minute": 60, "hour": 3600}[unit]
+                label = f"{amount} {unit}{'s' if amount != 1 else ''}"
+                threading.Thread(
+                    target=self._timer_callback, args=(seconds, label), daemon=True
+                ).start()
+                return f"Timer set for {label}, Sir."
+
+        # ── Reminder (flexible phrasing + word numbers) ───────────────────────
         # "remind me in 5 minutes", "remind me in an hour",
         # "set a reminder for 10 minutes", "remind me in half an hour"
         if re.search(r"\bremind\s+me\s+in\s+half\s+an\s+hour\b", t):
@@ -891,29 +929,32 @@ class VoiceAssistant:
             ).start()
             return "I'll remind you in 30 minutes, Sir."
 
-        m = re.search(
-            r"\b(?:remind\s+me\s+in|set\s+(?:a\s+)?reminder\s+(?:for|in))\s+"
-            r"(?:an?\s+)?(half\s+an?\s+)?"
-            r"(\d+)?\s*(second|minute|hour)s?\b", t
+        # "remind me in an hour" / "remind me in a minute"
+        m_rem_an = re.search(
+            r"\b(?:remind\s+me\s+in|set\s+(?:a\s+)?reminder\s+(?:for|in))\s+(?:an?\s+)" + _UNIT + r"\b", t
         )
-        if m:
-            half = m.group(1)
-            num_str = m.group(2)
-            unit = m.group(3)
-            if half and not num_str:
-                amount = 30 if unit == "hour" else 1
-                unit = "minute" if unit == "hour" else unit
-            elif num_str:
-                amount = int(num_str)
-            else:
-                # "an hour" / "a minute" — no number means 1
-                amount = 1
-            seconds = amount * {"second": 1, "minute": 60, "hour": 3600}[unit]
-            label = f"{amount} {unit}{'s' if amount != 1 else ''}"
+        if m_rem_an:
+            unit = m_rem_an.group(1)
+            seconds = {"second": 1, "minute": 60, "hour": 3600}[unit]
             threading.Thread(
-                target=self._timer_callback, args=(seconds, label), daemon=True
+                target=self._timer_callback, args=(seconds, f"1 {unit}"), daemon=True
             ).start()
-            return f"I'll remind you in {label}, Sir."
+            return f"I'll remind you in 1 {unit}, Sir."
+
+        # "remind me in 5 minutes" / "remind me in thirty seconds"
+        m_rem = re.search(
+            r"\b(?:remind\s+me\s+in|set\s+(?:a\s+)?reminder\s+(?:for|in))\s+" + _NUM + r"\s*" + _UNIT + r"\b", t
+        )
+        if m_rem:
+            amount = self._parse_number(m_rem.group(1))
+            unit = m_rem.group(2)
+            if amount:
+                seconds = amount * {"second": 1, "minute": 60, "hour": 3600}[unit]
+                label = f"{amount} {unit}{'s' if amount != 1 else ''}"
+                threading.Thread(
+                    target=self._timer_callback, args=(seconds, label), daemon=True
+                ).start()
+                return f"I'll remind you in {label}, Sir."
 
         # ── Open app ──────────────────────────────────────────────────────────
         m = re.search(
@@ -1062,6 +1103,7 @@ class VoiceAssistant:
         tts_t.start()
 
         first_audio_ready.wait(timeout=60)
+        self._tts_speaking = True
         stop_spin.set()
         spin_t.join()
 
@@ -1073,6 +1115,7 @@ class VoiceAssistant:
 
         player.wait()
         llm_t.join()
+        self._tts_speaking = False
         ws_server.set_state("idle")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
