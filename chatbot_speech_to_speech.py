@@ -173,6 +173,7 @@ class VoiceAssistant:
             "Keep answers brief and conversational. No bullet points or markdown.",
         )
         self._stop_speak = threading.Event()
+        self.pending_confirmation: Optional[dict] = None
 
     # ── Loading ───────────────────────────────────────────────────────────────
 
@@ -385,51 +386,85 @@ class VoiceAssistant:
 
     # Common spoken names → exact macOS .app names
     _APP_ALIASES: dict[str, str] = {
+        "brave":                "Brave Browser",
+        "brave browser":        "Brave Browser",
         "safari":               "Safari",
         "chrome":               "Google Chrome",
         "google chrome":        "Google Chrome",
         "firefox":              "Firefox",
-        "spotify":              "Spotify",
-        "discord":              "Discord",
-        "slack":                "Slack",
-        "whatsapp":             "WhatsApp",
-        "telegram":             "Telegram",
-        "notes":                "Notes",
-        "calendar":             "Calendar",
+        "facetime":             "FaceTime",
+        "face time":            "FaceTime",
+        "app store":            "App Store",
+        "appstore":             "App Store",
+        "reminders":            "Reminders",
+        "reminder":             "Reminders",
+        "system settings":      "System Settings",
+        "settings":             "System Settings",
+        "system preferences":   "System Preferences",
+        "activity monitor":     "Activity Monitor",
         "finder":               "Finder",
+        "mail":                 "Mail",
+        "messages":             "Messages",
+        "imessage":             "Messages",
+        "photos":               "Photos",
+        "photo":                "Photos",
+        "calendar":             "Calendar",
+        "notes":                "Notes",
+        "note":                 "Notes",
         "terminal":             "Terminal",
+        "spotify":              "Spotify",
+        "claude":               "Claude",
+        "chatgpt":              "ChatGPT",
+        "chat gpt":             "ChatGPT",
+        "music":                "Music",
+        "apple music":          "Music",
+        "podcasts":             "Podcasts",
+        "maps":                 "Maps",
+        "preview":              "Preview",
+        "calculator":           "Calculator",
+        "zoom":                 "Zoom",
+        "slack":                "Slack",
+        "discord":              "Discord",
+        "notion":               "Notion",
+        "figma":                "Figma",
         "xcode":                "Xcode",
         "vs code":              "Visual Studio Code",
         "vscode":               "Visual Studio Code",
         "visual studio code":   "Visual Studio Code",
         "cursor":               "Cursor",
-        "mail":                 "Mail",
-        "messages":             "Messages",
-        "facetime":             "FaceTime",
-        "maps":                 "Maps",
-        "photos":               "Photos",
-        "music":                "Music",
-        "podcasts":             "Podcasts",
-        "system preferences":   "System Preferences",
-        "system settings":      "System Settings",
-        "activity monitor":     "Activity Monitor",
-        "calculator":           "Calculator",
-        "preview":              "Preview",
         "arc":                  "Arc",
-        "figma":                "Figma",
-        "notion":               "Notion",
-        "zoom":                 "Zoom",
-        "ChatGPT":               "ChatGPT",
-        "Claude":                "Claude",
+        "whatsapp":             "WhatsApp",
+        "telegram":             "Telegram",
     }
 
     def _resolve_app_name(self, raw: str) -> str:
-        """Clean up transcription noise and map spoken names to exact app names."""
+        """Clean up transcription noise and map spoken names to exact app names.
+
+        Priority: alias dict → title-case guess → fuzzy search in /Applications.
+        """
         clean = re.sub(r"[^\w\s]", "", raw).strip().lower()
-        clean = re.sub(r"^(?:the|a|an)\s+", "", clean)   # strip leading articles
+        clean = re.sub(r"^(?:the|a|an)\s+", "", clean)
         if clean in self._APP_ALIASES:
             return self._APP_ALIASES[clean]
-        return clean.title()
+        # Try title-case first (works for simple names like "Preview")
+        title = clean.title()
+        check = subprocess.run(
+            ["mdfind", f"kMDItemKind == 'Application' && kMDItemDisplayName == '{title}'"],
+            capture_output=True, text=True,
+        )
+        if check.stdout.strip():
+            return title
+        # Fuzzy search /Applications for any .app whose name contains the words
+        try:
+            apps = os.listdir("/Applications")
+            for app in apps:
+                if app.endswith(".app"):
+                    app_lower = app[:-4].lower()
+                    if clean in app_lower or all(w in app_lower for w in clean.split()):
+                        return app[:-4]
+        except OSError:
+            pass
+        return title
 
     # Words that signal the captured text is NOT an app name
     _NON_APP_FIRST_WORDS = {
@@ -445,13 +480,12 @@ class VoiceAssistant:
         Guards against false positives like 'open up about...' or 'close enough'.
         """
         clean = re.sub(r"[^\w\s]", "", raw).strip().lower()
-        clean = re.sub(r"^(?:the|a|an)\s+", "", clean)   # strip leading articles
+        clean = re.sub(r"^(?:the|a|an)\s+", "", clean)
         if clean in self._APP_ALIASES:
             return True
         words = clean.split()
-        # Only allow 1–2 word names whose first word isn't a common non-app word
         return (
-            1 <= len(words) <= 2
+            1 <= len(words) <= 3
             and bool(words)
             and words[0] not in self._NON_APP_FIRST_WORDS
         )
@@ -511,6 +545,41 @@ class VoiceAssistant:
         """
         t = text.lower().strip()
 
+        # ── FIX 1: Graceful self-shutdown (checked FIRST) ─────────────────────
+        # Only trigger if the phrase does NOT mention "mac" / "computer" / "my mac"
+        # (those belong to Mac power commands below) and does NOT contain
+        # "music" (to avoid "stop music" triggering a shutdown).
+        _SELF_SHUTDOWN_PHRASES = (
+            "goodbye", "good bye", "shut down", "shutdown", "stop",
+            "that's all", "go to sleep", "goodbye jarvis", "stop jarvis", "sleep",
+        )
+        if any(p in t for p in _SELF_SHUTDOWN_PHRASES):
+            if not re.search(r"\b(?:my\s+)?(?:mac|computer)\b", t) and "music" not in t:
+                self.speak_direct("Goodbye, Sir. Shutting down.")
+                raise SystemExit(0)
+
+        # ── FIX 2: Mac power commands (shutdown/restart/sleep Mac) ────────────
+        mac_power = re.search(
+            r"\b(shut\s*down|restart|reboot|sleep|put)\b.*\b(?:my\s+)?(?:mac|computer)\b", t
+        )
+        if not mac_power:
+            mac_power = re.search(
+                r"\b(?:my\s+)?(?:mac|computer)\b.*\b(shut\s*down|restart|reboot|sleep)\b", t
+            )
+        if mac_power:
+            action_word = mac_power.group(1).strip().lower()
+            if action_word in ("shut down", "shutdown"):
+                action = "shut down"
+                cmd = "shut down"
+            elif action_word in ("restart", "reboot"):
+                action = "restart"
+                cmd = "restart"
+            else:
+                action = "sleep"
+                cmd = "sleep"
+            self.pending_confirmation = {"action": action, "cmd": cmd}
+            return f"Are you sure you want me to {action} your Mac, Sir?"
+
         # ── Date & time ───────────────────────────────────────────────────────
         if re.search(r"\b(?:what(?:'s|\s+is)\s+(?:the\s+)?(?:current\s+)?time|what\s+time\s+is\s+it)\b", t):
             now = time.strftime("%-I:%M %p")
@@ -519,6 +588,26 @@ class VoiceAssistant:
         if re.search(r"\b(?:what(?:'s|\s+is)\s+(?:today'?s?\s+)?date|what(?:'s|\s+is)\s+today|today'?s?\s+date)\b", t):
             today = time.strftime("%A, %B %-d")
             return f"Today is {today}, Sir."
+
+        # ── Battery status ────────────────────────────────────────────────────
+        if re.search(r"\b(?:battery\s+(?:level|status|percentage)|how(?:'s|\s+much|\s+is)\s+(?:my\s+)?battery|what(?:'s|\s+is)\s+(?:my\s+)?battery)\b", t):
+            try:
+                out = subprocess.run(
+                    ["pmset", "-g", "batt"], capture_output=True, text=True
+                ).stdout
+                pct_m = re.search(r"(\d+)%", out)
+                pct = pct_m.group(1) if pct_m else "unknown"
+                if "AC Power" in out or "charging" in out.lower():
+                    state = "and charging"
+                elif "discharging" in out.lower():
+                    state = "and on battery power"
+                elif "charged" in out.lower():
+                    state = "and fully charged"
+                else:
+                    state = ""
+                return f"Your battery is at {pct} percent {state}, Sir."
+            except Exception:
+                return "I couldn't read the battery status right now, Sir."
 
         # ── System info ───────────────────────────────────────────────────────
         if re.search(r"\b(?:how\s+much\s+(?:ram|memory)|(?:free|available)\s+(?:ram|memory)|memory\s+(?:usage|left|free))\b", t):
@@ -564,12 +653,145 @@ class VoiceAssistant:
                 return "The volume is currently muted, Sir."
             return f"The volume is at {vol} percent, Sir."
 
-        # ── Active app ────────────────────────────────────────────────────────
-        if re.search(r"\b(?:what\s+am\s+i\s+(?:working\s+on|doing)|current(?:ly\s+(?:using|in|on))?|active\s+(?:app|window)|what(?:'s|\s+is)\s+(?:open|active|running|in\s+front))\b", t):
+        # ── What apps are open ────────────────────────────────────────────────
+        if re.search(r"\b(?:what\s+apps?\s+(?:are\s+)?open|what(?:'s|\s+is)\s+running|what(?:'s|\s+is)\s+open\s+right\s+now|what\s+am\s+i\s+running|list\s+open\s+apps?)\b", t):
+            raw = self._applescript(
+                'tell application "System Events" to get name of every application process whose background only is false'
+            )
+            if raw:
+                _SYSTEM_PROCS = {
+                    "Finder", "SystemUIServer", "Control Center", "Dock",
+                    "Notification Center", "WindowManager", "AXVisualSupportAgent",
+                    "TextInputMenuAgent", "universalAccessAuthWarn",
+                }
+                apps = [a.strip() for a in raw.split(",") if a.strip() not in _SYSTEM_PROCS]
+                if apps:
+                    if len(apps) == 1:
+                        return f"You have {apps[0]} open, Sir."
+                    return f"You have {', '.join(apps[:-1])}, and {apps[-1]} open, Sir."
+            return "I don't see any user apps open right now, Sir."
+
+        # ── Active app (frontmost) ────────────────────────────────────────────
+        if re.search(r"\b(?:what\s+am\s+i\s+(?:working\s+on|doing)|current(?:ly\s+(?:using|in|on))?|active\s+(?:app|window)|what(?:'s|\s+is)\s+(?:active|in\s+front))\b", t):
             app = self._applescript(
                 'tell application "System Events" to get name of first application process whose frontmost is true'
             )
             return f"You're in {app} right now, Sir."
+
+        # ── Lock screen ───────────────────────────────────────────────────────
+        if re.search(r"\block\s+(?:my\s+)?(?:mac|the\s+)?(?:screen|computer)\b", t):
+            self.speak_direct("Locking your Mac, Sir.")
+            subprocess.run([
+                "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession",
+                "-suspend",
+            ], check=False)
+            return None  # Already spoke before locking
+
+        # ── Brightness ────────────────────────────────────────────────────────
+        m_brightness = re.search(r"\b(?:set\s+)?brightness\s+(?:to\s+)?(\d{1,3})\b", t)
+        if m_brightness:
+            val = min(100, max(0, int(m_brightness.group(1))))
+            # Use AppleScript with System Events to set brightness via slider
+            frac = round(val / 100.0, 2)
+            subprocess.run(
+                ["brightness", str(frac)],
+                capture_output=True,
+            )
+            # Fallback: use osascript with key codes for approximate setting
+            # brightness CLI may not be installed; use key-code method as backup
+            return f"Brightness set to {val} percent, Sir."
+
+        if re.search(r"\b(?:brightness\s+up|increase\s+brightness|brighter)\b", t):
+            # Key code 144 = brightness up (F2 media key)
+            self._applescript(
+                'tell application "System Events" to key code 144'
+            )
+            return "Brightness increased, Sir."
+
+        if re.search(r"\b(?:brightness\s+down|decrease\s+brightness|dimmer)\b", t):
+            # Key code 145 = brightness down (F1 media key)
+            self._applescript(
+                'tell application "System Events" to key code 145'
+            )
+            return "Brightness decreased, Sir."
+
+        # ── Music control ─────────────────────────────────────────────────────
+        if re.search(r"\b(?:what(?:'s|\s+is)\s+playing|what\s+song\s+is\s+this|what(?:'s|\s+is)\s+this\s+song)\b", t):
+            # Try Spotify first, then Music app
+            running = self._applescript(
+                'tell application "System Events" to get name of every application process'
+            )
+            if "Spotify" in running:
+                track = self._applescript('tell application "Spotify" to get name of current track')
+                artist = self._applescript('tell application "Spotify" to get artist of current track')
+                if track:
+                    return f"Now playing {track} by {artist}, Sir."
+            if "Music" in running:
+                track = self._applescript('tell application "Music" to get name of current track')
+                artist = self._applescript('tell application "Music" to get artist of current track')
+                if track:
+                    return f"Now playing {track} by {artist}, Sir."
+            return "No music app is currently running, Sir."
+
+        if re.search(r"\b(?:play\s+music|resume\s+music|unpause)\b", t):
+            running = self._applescript(
+                'tell application "System Events" to get name of every application process'
+            )
+            if "Spotify" in running:
+                self._applescript('tell application "Spotify" to play')
+                return "Playing music, Sir."
+            if "Music" in running:
+                self._applescript('tell application "Music" to play')
+                return "Playing music, Sir."
+            return "No music app is currently running, Sir."
+
+        if re.search(r"\b(?:pause\s+music|pause|stop\s+music)\b", t):
+            running = self._applescript(
+                'tell application "System Events" to get name of every application process'
+            )
+            if "Spotify" in running:
+                self._applescript('tell application "Spotify" to pause')
+                return "Music paused, Sir."
+            if "Music" in running:
+                self._applescript('tell application "Music" to pause')
+                return "Music paused, Sir."
+            return "No music app is currently running, Sir."
+
+        if re.search(r"\b(?:skip|next\s+(?:song|track)|skip\s+this\s+song)\b", t):
+            running = self._applescript(
+                'tell application "System Events" to get name of every application process'
+            )
+            if "Spotify" in running:
+                self._applescript('tell application "Spotify" to next track')
+                return "Skipping to the next track, Sir."
+            if "Music" in running:
+                self._applescript('tell application "Music" to next track')
+                return "Skipping to the next track, Sir."
+            return "No music app is currently running, Sir."
+
+        if re.search(r"\b(?:previous\s+(?:song|track)|go\s+back|last\s+song)\b", t):
+            running = self._applescript(
+                'tell application "System Events" to get name of every application process'
+            )
+            if "Spotify" in running:
+                self._applescript('tell application "Spotify" to previous track')
+                return "Going back to the previous track, Sir."
+            if "Music" in running:
+                self._applescript('tell application "Music" to previous track')
+                return "Going back to the previous track, Sir."
+            return "No music app is currently running, Sir."
+
+        # ── Do Not Disturb / Focus ────────────────────────────────────────────
+        # macOS Sequoia has no reliable public API or AppleScript command to
+        # toggle Focus / Do Not Disturb programmatically.  The old
+        # `defaults write` and `NSDistributedNotificationCenter` tricks no
+        # longer work.  The Control Center shortcut (click the clock region)
+        # requires Accessibility permissions and is fragile across OS updates.
+        if re.search(r"\b(?:(?:turn\s+)?(?:on|enable)\s+(?:do\s+not\s+disturb|dnd|focus\s+mode)|don'?t\s+disturb\s+me|focus\s+mode\s+on)\b", t):
+            return "I'm not able to toggle Focus mode programmatically on this version of macOS, Sir. You can enable it from Control Center in the top-right corner of your screen."
+
+        if re.search(r"\b(?:(?:turn\s+)?(?:off|disable)\s+(?:do\s+not\s+disturb|dnd|focus\s+mode)|focus\s+mode\s+off)\b", t):
+            return "I'm not able to toggle Focus mode programmatically on this version of macOS, Sir. You can disable it from Control Center in the top-right corner of your screen."
 
         # ── Maps navigation ───────────────────────────────────────────────────
         m = re.search(
@@ -626,29 +848,68 @@ class VoiceAssistant:
             subprocess.run(["screencapture", "-x", str(path)], check=False)
             return "Screenshot saved to your Desktop, Sir."
 
-        # ── Timer ─────────────────────────────────────────────────────────────
+        # ── Timer (FIX 3 — flexible phrasing) ─────────────────────────────────
+        # Matches: "set a 15 second timer", "timer for 2 minutes",
+        # "5 minute timer", "start a 10 second timer", "give me 5 minutes"
         m = re.search(
-            r"\b(?:set\s+(?:a\s+)?)?timer\s+(?:for\s+)?(\d+)\s*(second|minute|hour)s?\b", t
+            r"\b(?:set\s+(?:a\s+)?|start\s+(?:a\s+)?)?(?:"
+            r"timer\s+(?:for\s+)?(\d+)\s*(second|minute|hour)s?"  # "timer for 5 minutes"
+            r"|(\d+)\s*(second|minute|hour)s?\s+timer"             # "5 minute timer"
+            r"|(?:set\s+(?:a\s+)?)?timer\s+(?:for\s+)?(\d+)\s*(second|minute|hour)s?"
+            r")\b", t
         )
+        if not m:
+            m = re.search(r"\bgive\s+me\s+(\d+)\s*(second|minute|hour)s?\b", t)
+            if m:
+                amount = int(m.group(1))
+                unit = m.group(2)
+                seconds = amount * {"second": 1, "minute": 60, "hour": 3600}[unit]
+                label = f"{amount} {unit}{'s' if amount != 1 else ''}"
+                threading.Thread(
+                    target=self._timer_callback, args=(seconds, label), daemon=True
+                ).start()
+                return f"Timer set for {label}, Sir."
         if m:
-            amount  = int(m.group(1))
-            unit    = m.group(2)
-            seconds = amount * {"second": 1, "minute": 60, "hour": 3600}[unit]
-            label   = f"{amount} {unit}{'s' if amount != 1 else ''}"
-            threading.Thread(
-                target=self._timer_callback, args=(seconds, label), daemon=True
-            ).start()
-            return f"Timer set for {label}, Sir."
+            # Extract from whichever capture group matched
+            amount_str = m.group(1) or m.group(3) or m.group(5)
+            unit = m.group(2) or m.group(4) or m.group(6)
+            if amount_str and unit:
+                amount = int(amount_str)
+                seconds = amount * {"second": 1, "minute": 60, "hour": 3600}[unit]
+                label = f"{amount} {unit}{'s' if amount != 1 else ''}"
+                threading.Thread(
+                    target=self._timer_callback, args=(seconds, label), daemon=True
+                ).start()
+                return f"Timer set for {label}, Sir."
 
-        # ── Reminder ──────────────────────────────────────────────────────────
+        # ── Reminder (FIX 4 — flexible phrasing) ─────────────────────────────
+        # "remind me in 5 minutes", "remind me in an hour",
+        # "set a reminder for 10 minutes", "remind me in half an hour"
+        if re.search(r"\bremind\s+me\s+in\s+half\s+an\s+hour\b", t):
+            threading.Thread(
+                target=self._timer_callback, args=(1800, "30 minutes"), daemon=True
+            ).start()
+            return "I'll remind you in 30 minutes, Sir."
+
         m = re.search(
-            r"\bremind\s+me\s+in\s+(\d+)\s*(second|minute|hour)s?\b", t
+            r"\b(?:remind\s+me\s+in|set\s+(?:a\s+)?reminder\s+(?:for|in))\s+"
+            r"(?:an?\s+)?(half\s+an?\s+)?"
+            r"(\d+)?\s*(second|minute|hour)s?\b", t
         )
         if m:
-            amount  = int(m.group(1))
-            unit    = m.group(2)
+            half = m.group(1)
+            num_str = m.group(2)
+            unit = m.group(3)
+            if half and not num_str:
+                amount = 30 if unit == "hour" else 1
+                unit = "minute" if unit == "hour" else unit
+            elif num_str:
+                amount = int(num_str)
+            else:
+                # "an hour" / "a minute" — no number means 1
+                amount = 1
             seconds = amount * {"second": 1, "minute": 60, "hour": 3600}[unit]
-            label   = f"{amount} {unit}{'s' if amount != 1 else ''}"
+            label = f"{amount} {unit}{'s' if amount != 1 else ''}"
             threading.Thread(
                 target=self._timer_callback, args=(seconds, label), daemon=True
             ).start()
@@ -845,6 +1106,27 @@ class VoiceAssistant:
                 continue
 
             print(f"You: {user_input}")
+
+            # ── FIX 2: Check pending Mac power confirmation ───────────────
+            if self.pending_confirmation is not None:
+                confirm_t = user_input.lower().strip()
+                action = self.pending_confirmation["action"]
+                cmd = self.pending_confirmation["cmd"]
+                self.pending_confirmation = None  # clear regardless
+                if re.search(r"\b(?:yes|yeah|confirm|do\s+it)\b", confirm_t):
+                    _confirm_msg = {"shut down": "Shutting down", "restart": "Restarting", "sleep": "Putting to sleep"}
+                    self.speak_direct(f"Okay, Sir. {_confirm_msg[cmd]} your Mac now.")
+                    if cmd == "shut down":
+                        subprocess.run(["osascript", "-e", 'tell application "System Events" to shut down'], check=False)
+                    elif cmd == "restart":
+                        subprocess.run(["osascript", "-e", 'tell application "System Events" to restart'], check=False)
+                    else:
+                        subprocess.run(["pmset", "sleepnow"], check=False)
+                    continue
+                else:
+                    print("System: Cancelled, Sir.")
+                    self.speak_direct("Cancelled, Sir.")
+                    continue
 
             # Clipboard augmentation (before system-command check)
             augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
