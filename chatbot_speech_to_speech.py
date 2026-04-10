@@ -1409,16 +1409,13 @@ class VoiceAssistant:
                 if not audio:
                     continue  # Timer is already running — don't touch it
 
-                # User said something — cancel inactivity timer while we process
-                self._cancel_conversation_timer()
-
                 user_input = self.transcribe(audio)
                 if not user_input:
                     print("  (Didn't catch that — try again)\n")
-                    # Restart timer since transcription failed
-                    if self._in_conversation:
-                        self._start_conversation_timer()
-                    continue
+                    continue  # Timer keeps running — don't touch it
+
+                # Confirmed speech — cancel timer while Jarvis processes and responds
+                self._cancel_conversation_timer()
 
                 print(f"You: {user_input}")
 
