@@ -59,3 +59,10 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Xcode user data
+JarvisApp/JarvisApp.xcodeproj/project.xcuserdata/
+*.xcuserstate
+
+# Training script (not needed at runtime)
+train.py

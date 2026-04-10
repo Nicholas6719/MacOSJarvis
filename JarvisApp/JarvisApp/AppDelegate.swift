@@ -323,7 +323,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 10. Separator
         menu.addItem(.separator())
 
-        // 12. Quit
+        // 11. Quit
         let quitItem = NSMenuItem(title: "Quit Jarvis", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quitItem)
 

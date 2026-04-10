@@ -35,7 +35,6 @@ final class BackendManager: ObservableObject {
     @Published var logs:         String = ""   // backend runtime logs
     @Published var lastSTT:      String = ""   // latest voice transcription
     @Published var lastExitCode: Int32  = -1   // exit code of last backend run
-    @Published var currentState: String = "idle"  // for future use; primary state via HTTP polling
 
     var startupMode: String = "wake"
 

@@ -14,7 +14,6 @@ Usage inside Python:
 """
 
 import asyncio
-import functools
 import http.server
 import json
 import logging
@@ -178,9 +177,9 @@ class _APIOnlyHandler(http.server.BaseHTTPRequestHandler):
                 "<!DOCTYPE html><html><head><meta charset=\"utf-8\"/><title>Jarvis</title></head>"
                 "<body style=\"font-family:system-ui;padding:2rem\">"
                 "<h1>Jarvis</h1>"
-                "<p>Die Web-UI fehlt. Im Projektordner ausführen:</p>"
+                "<p>The web UI is missing. Run this in the project folder:</p>"
                 "<pre style=\"background:#eee;padding:1rem\">cd frontend && npm install && npm run build</pre>"
-                "<p>Dann Jarvis neu starten.</p></body></html>"
+                "<p>Then restart Jarvis.</p></body></html>"
             )
             b = html.encode("utf-8")
             self.send_response(200)
@@ -204,8 +203,8 @@ def _serve_http() -> None:
 
     if not has_dist:
         msg = (
-            f"[http-server] {_DIST_DIR} fehlt — starte nur API auf Port {HTTP_PORT} "
-            "(cd frontend && npm run build für die volle UI)\n"
+            f"[http-server] {_DIST_DIR} missing — starting API-only on port {HTTP_PORT} "
+            "(cd frontend && npm run build for the full UI)\n"
         )
         logger.warning(msg.strip())
         print(msg, flush=True)

@@ -724,10 +724,6 @@ class VoiceAssistant:
         time.sleep(2.0)
         self._drain_q()
 
-    def _check_lang_switch(self) -> None:
-        """Placeholder for future language-switching support."""
-        pass
-
     # ── System commands ───────────────────────────────────────────────────────
 
     def _handle_system_command(self, text: str) -> Optional[str]:
@@ -1340,8 +1336,6 @@ class VoiceAssistant:
 
         while True:
             try:
-                self._check_lang_switch()
-
                 if ws_server.is_muted():
                     ws_server.set_state("idle")
                     time.sleep(0.1)
@@ -1457,7 +1451,7 @@ class VoiceAssistant:
 
 
 if __name__ == "__main__":
-    # HTTP/WebSocket sofort — bevor schwere ML-Imports in VoiceAssistant laufen.
+    # Start HTTP/WebSocket servers first — before heavy ML imports in VoiceAssistant.
     ws_server.start()
     assistant = VoiceAssistant()
     assistant.run()
