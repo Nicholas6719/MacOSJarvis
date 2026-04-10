@@ -59,6 +59,9 @@ final class WaveformIconView: NSView {
 
 struct WKWebViewRepresentable: NSViewRepresentable {
 
+    /// Callback so AppDelegate can store a reference to the WKWebView for forced reloads.
+    var onWebViewCreated: ((JarvisWebView) -> Void)?
+
     func makeNSView(context: Context) -> JarvisWebView {
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
@@ -70,6 +73,8 @@ struct WKWebViewRepresentable: NSViewRepresentable {
         if let url = URL(string: "http://localhost:3000") {
             webView.load(URLRequest(url: url))
         }
+
+        onWebViewCreated?(webView)
         return webView
     }
 
@@ -88,6 +93,24 @@ struct WKWebViewRepresentable: NSViewRepresentable {
                 decisionHandler(.cancel)
             }
         }
+
+        /// Retry on connection refused (backend not ready yet).
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                if let url = URL(string: "http://localhost:3000") {
+                    webView.load(URLRequest(url: url))
+                }
+            }
+        }
+
+        /// Retry on mid-load failure.
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                if let url = URL(string: "http://localhost:3000") {
+                    webView.load(URLRequest(url: url))
+                }
+            }
+        }
     }
 }
 
@@ -103,11 +126,12 @@ final class JarvisWebView: WKWebView {
 
 struct OrbContentView: View {
     @EnvironmentObject var backend: BackendManager
+    var onWebViewCreated: ((JarvisWebView) -> Void)?
 
     var body: some View {
         ZStack {
             Color.black
-            WKWebViewRepresentable()
+            WKWebViewRepresentable(onWebViewCreated: onWebViewCreated)
             VStack {
                 Spacer()
                 HStack {
@@ -131,10 +155,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var statusItem: NSStatusItem?
     private var orbWindow: NSPanel?
+    private var orbWebView: JarvisWebView?
     private var logsWindow: NSWindow?
     private var waveformView = WaveformIconView(frame: NSRect(x: 0, y: 0, width: 28, height: 18))
     private var isMuted = false
     private var phaseTimer: Timer?
+    private var lastObservedPhase: BackendManager.Phase = .idle
 
     // MARK: - Lifecycle
 
@@ -150,6 +176,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         phaseTimer?.invalidate()
         backendManager.stop()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        orbWindow?.orderFrontRegardless()
+    }
+
+    func applicationWillResignActive(_ notification: Notification) {
+        orbWindow?.orderFrontRegardless()
     }
 
     // MARK: - Menubar
@@ -221,15 +255,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.isMovableByWindowBackground = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.hidesOnDeactivate = false
+        panel.canHide = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
 
         // Position bottom-right of screen
         if let screen = NSScreen.main?.visibleFrame {
             panel.setFrameOrigin(NSPoint(x: screen.maxX - 440, y: screen.minY + 20))
         }
 
-        let orbContent = OrbContentView()
-            .environmentObject(backendManager)
+        let orbContent = OrbContentView(onWebViewCreated: { [weak self] webView in
+            self?.orbWebView = webView
+        })
+        .environmentObject(backendManager)
 
         panel.contentView = NSHostingView(rootView: orbContent)
         orbWindow = panel
@@ -245,7 +283,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let menu = self.statusItem?.menu
                 let statusMenuItem = menu?.item(withTag: 100)
 
-                switch self.backendManager.phase {
+                let currentPhase = self.backendManager.phase
+                let wasReady = self.lastObservedPhase == .ready
+                self.lastObservedPhase = currentPhase
+
+                switch currentPhase {
                 case .idle:
                     self.waveformView.stopAnimating()
                     statusMenuItem?.title = "● Idle"
@@ -255,6 +297,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 case .ready:
                     self.waveformView.startAnimating()
                     statusMenuItem?.title = "● Ready"
+                    // Force a fresh load once when backend first becomes ready
+                    if !wasReady, let url = URL(string: "http://localhost:3000") {
+                        self.orbWebView?.load(URLRequest(url: url))
+                    }
                 case .failed:
                     self.waveformView.stopAnimating()
                     statusMenuItem?.title = "● Error"
@@ -283,6 +329,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func restartJarvis() {
         Task { @MainActor in
             self.backendManager.restart()
+            // Give backend a head start then trigger a reload
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            if let url = URL(string: "http://localhost:3000") {
+                self.orbWebView?.load(URLRequest(url: url))
+            }
+            self.orbWindow?.orderFrontRegardless()
         }
     }
 
