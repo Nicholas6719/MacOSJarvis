@@ -237,6 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenubar()
         setupOrbWindow()
         backendManager.start()
+        waveformView.setWakeMode(true)
         startPhaseObserver()
         startStatePoller()
         requestMicrophonePermission()
@@ -391,7 +392,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         panel.contentView = NSHostingView(rootView: orbContent)
         orbWindow = panel
-        panel.orderFrontRegardless()
+        panel.orderOut(nil)
     }
 
     // MARK: - Phase observer

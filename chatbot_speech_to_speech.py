@@ -196,6 +196,7 @@ class VoiceAssistant:
         # Wake word state
         self._in_conversation = False
         self._conversation_timer: Optional[threading.Timer] = None
+        self._return_to_wake = threading.Event()
         self._wake_model: Optional[WakeWordModel] = None
         self._wake_audio = None
         self._wake_stream = None
@@ -696,8 +697,9 @@ class VoiceAssistant:
     def _end_conversation(self) -> None:
         self._in_conversation = False
         self._cancel_conversation_timer()
+        self._return_to_wake.set()
         ws_server.set_state("wake")
-        print("\n[WAKE] Conversation timed out — returning to wake mode", flush=True)
+        print("\n[WAKE] Returning to wake mode", flush=True)
 
     def _check_lang_switch(self) -> None:
         """Placeholder for future language-switching support."""
@@ -1315,6 +1317,7 @@ class VoiceAssistant:
                     detected = self._listen_for_wake_word()
                     if detected:
                         self._in_conversation = True
+                        self._return_to_wake.clear()
                         self._start_conversation_timer()
                         ws_server.set_state("listening")
                         print(
@@ -1323,17 +1326,20 @@ class VoiceAssistant:
                         )
                     continue
 
+                # Check if we should return to wake mode
+                if self._return_to_wake.is_set():
+                    self._return_to_wake.clear()
+                    continue
+
                 # CONVERSATION MODE: full voice pipeline
                 # Check pending Mac power confirmation first
                 if (self.pending_confirmation is not None):
                     action = self.pending_confirmation.get('action')
                     audio = self.record_audio()
                     if not audio:
-                        self._start_conversation_timer()
                         continue
                     response_text = self.transcribe(audio)
                     if not response_text:
-                        self._start_conversation_timer()
                         continue
                     print(f"You: {response_text}")
                     t_conf = response_text.lower().strip()
@@ -1364,8 +1370,37 @@ class VoiceAssistant:
 
                 audio = self.record_audio()
                 if not audio:
-                    self._start_conversation_timer()
                     continue
+
+                user_input = self.transcribe(audio)
+                if not user_input:
+                    print("  (Didn't catch that — try again)\n")
+                    continue
+
+                print(f"You: {user_input}")
+
+                # Reset conversation timer on each successful interaction
+                self._start_conversation_timer()
+
+                # Clipboard augmentation
+                augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
+
+                # System command or LLM
+                sys_response = self._handle_system_command(user_input)
+                if sys_response:
+                    print(f"System: {sys_response}")
+                    self.speak_direct(sys_response)
+                else:
+                    self.handle_turn(augmented_input)
+
+                # Copy LLM response to clipboard if requested
+                if is_clipboard and self.history:
+                    last = self.history[-1].get("content", "")
+                    if last:
+                        self._copy_to_clipboard(last)
+                        print("📋  Response copied to clipboard.", flush=True)
+
+                print()
 
             except KeyboardInterrupt:
                 print("\nGoodbye.")
@@ -1379,37 +1414,6 @@ class VoiceAssistant:
                 self._cleanup_wake_word()
                 ws_server.set_state("idle")
                 break
-
-            user_input = self.transcribe(audio)
-            if not user_input:
-                print("  (Didn't catch that — try again)\n")
-                self._start_conversation_timer()
-                continue
-
-            print(f"You: {user_input}")
-
-            # Reset conversation timer on each successful interaction
-            self._start_conversation_timer()
-
-            # Clipboard augmentation
-            augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
-
-            # System command or LLM
-            sys_response = self._handle_system_command(user_input)
-            if sys_response:
-                print(f"System: {sys_response}")
-                self.speak_direct(sys_response)
-            else:
-                self.handle_turn(augmented_input)
-
-            # Copy LLM response to clipboard if requested
-            if is_clipboard and self.history:
-                last = self.history[-1].get("content", "")
-                if last:
-                    self._copy_to_clipboard(last)
-                    print("📋  Response copied to clipboard.", flush=True)
-
-            print()
 
 
 if __name__ == "__main__":
