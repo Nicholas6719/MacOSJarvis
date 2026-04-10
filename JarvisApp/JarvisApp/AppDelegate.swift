@@ -496,9 +496,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func togglePause() {
         Task { @MainActor in
             if self.isPaused {
-                // Resume
+                // Resume — start in conversation mode with 15s timer
                 self.isPaused = false
-                self.orbWindow?.orderFrontRegardless()
+                self.backendManager.startupMode = "conversation"
                 self.backendManager.start()
                 self.updateMenuForState(.starting)
             } else {

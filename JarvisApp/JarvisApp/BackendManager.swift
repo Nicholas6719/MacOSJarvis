@@ -37,6 +37,8 @@ final class BackendManager: ObservableObject {
     @Published var lastExitCode: Int32  = -1   // exit code of last backend run
     @Published var currentState: String = "idle"  // for future use; primary state via HTTP polling
 
+    var startupMode: String = "wake"
+
     // MARK: - Private
 
     private var process:       Process?
@@ -87,7 +89,10 @@ final class BackendManager: ObservableObject {
         // Prepend venv/bin to PATH so subprocesses find the right Python
         let venvBin = (venvPython as NSString).deletingLastPathComponent
         env["PATH"] = "\(venvBin):\(env["PATH"] ?? "/usr/bin:/bin")"
+        env["JARVIS_STARTUP_MODE"] = startupMode
         proc.environment = env
+        // Reset to default so subsequent restarts use wake mode
+        startupMode = "wake"
 
         let outPipe = Pipe()
         let errPipe = Pipe()

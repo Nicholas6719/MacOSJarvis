@@ -66,6 +66,8 @@ WAKE_WORD_MODEL = "hey_jarvis"
 WAKE_WORD_THRESHOLD = 0.75
 CONVERSATION_TIMEOUT = 15.0
 WAKE_CHUNK_SIZE = 1280
+STARTUP_MODE = os.environ.get("JARVIS_STARTUP_MODE", "wake")
+WAKE_MODE_SENTINEL = "__WAKE_MODE__"
 
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 CLAUSE_RE   = re.compile(r"(?<=[,;:])\s+")
@@ -313,6 +315,9 @@ class VoiceAssistant:
             ws_server.set_state("idle")
             time.sleep(0.1)
 
+        # Pause conversation timer while user is speaking
+        if self._in_conversation:
+            self._cancel_conversation_timer()
         # Short pause + drain so the mic doesn't pick up residual TTS audio
         time.sleep(0.2)
         self._drain_q()
@@ -401,6 +406,7 @@ class VoiceAssistant:
     def speak_direct(self, text: str) -> None:
         """Speak text immediately via TTS — no LLM involved."""
         self._tts_speaking = True
+        self._cancel_conversation_timer()  # Pause timer while speaking
         ws_server.set_state("speaking")
         try:
             wav    = self._synthesise(text)
@@ -414,6 +420,9 @@ class VoiceAssistant:
             self._drain_q()
             self._tts_speaking = False
             ws_server.set_state("idle")
+            # Resume timer after speaking if still in conversation mode
+            if self._in_conversation:
+                self._start_conversation_timer()
 
     def stop_speaking(self) -> None:
         self._stop_speak.set()
@@ -742,8 +751,10 @@ class VoiceAssistant:
             r"\b(?:return\s+to\s+wake\s+mode|go\s+to\s+sleep|wake\s+mode|"
             r"stop\s+listening|back\s+to\s+sleep)\b", t
         ):
+            # Speak FIRST, then go to sleep
+            self.speak_direct("Returning to wake mode.")
             self._end_conversation()
-            return "Going to sleep."
+            return WAKE_MODE_SENTINEL  # Tell run loop not to speak this
 
         # ── FIX 2: Mac power commands (shutdown/restart/sleep Mac) ────────────
         mac_power = re.search(
@@ -1241,6 +1252,7 @@ class VoiceAssistant:
 
     def handle_turn(self, user_input: str) -> None:
         """Three-thread pipeline: LLM → TTS → SeamlessPlayer (zero-gap audio)."""
+        self._cancel_conversation_timer()  # Pause while processing + speaking
         self._stop_speak.clear()
         ws_server.set_state("thinking")
 
@@ -1298,6 +1310,9 @@ class VoiceAssistant:
 
         player.wait()
         llm_t.join()
+        # Resume conversation timer after LLM response finishes speaking
+        if self._in_conversation:
+            self._start_conversation_timer()
         ws_server.set_state("idle")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
@@ -1310,7 +1325,13 @@ class VoiceAssistant:
         print("═" * 58 + "\n")
 
         self._init_wake_word()
-        ws_server.set_state("wake")
+        if STARTUP_MODE == "conversation":
+            self._in_conversation = True
+            self._start_conversation_timer()
+            ws_server.set_state("listening")
+            print("\n[STARTUP] Starting in conversation mode", flush=True)
+        else:
+            ws_server.set_state("wake")
 
         while True:
             try:
@@ -1398,9 +1419,11 @@ class VoiceAssistant:
 
                 # System command or LLM
                 sys_response = self._handle_system_command(user_input)
-                if sys_response:
+                if sys_response and sys_response != WAKE_MODE_SENTINEL:
                     print(f"System: {sys_response}")
                     self.speak_direct(sys_response)
+                elif sys_response == WAKE_MODE_SENTINEL:
+                    pass  # Already spoken and handled inside the command
                 else:
                     self.handle_turn(augmented_input)
 
