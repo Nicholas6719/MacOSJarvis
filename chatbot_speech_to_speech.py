@@ -175,6 +175,7 @@ class VoiceAssistant:
         )
         self._stop_speak = threading.Event()
         self._tts_speaking = False
+        self._cancel_timer = threading.Event()
         self.pending_confirmation: Optional[dict] = None
 
     # ── Loading ───────────────────────────────────────────────────────────────
@@ -440,6 +441,7 @@ class VoiceAssistant:
         "terminal":             "Terminal",
         "spotify":              "Spotify",
         "claude":               "Claude",
+        "clawed":               "Claude",
         "chatgpt":              "ChatGPT",
         "chat gpt":             "ChatGPT",
         "music":                "Music",
@@ -568,7 +570,11 @@ class VoiceAssistant:
         return self._WORD_NUMBERS.get(s)
 
     def _timer_callback(self, seconds: int, label: str) -> None:
-        time.sleep(seconds)
+        for _ in range(seconds * 10):
+            if self._cancel_timer.is_set():
+                self._cancel_timer.clear()
+                return
+            time.sleep(0.1)
         msg = f"Sir, your {label} timer is up."
         print(f"\n⏰  {msg}", flush=True)
         subprocess.run(
@@ -875,13 +881,13 @@ class VoiceAssistant:
             self._applescript("set volume output muted true")
             return "Muted, Sir."
 
-        if re.search(r"\b(?:turn\s+up|louder|raise\s+(?:the\s+)?volume|increase\s+(?:the\s+)?volume|volume\s+up)\b", t):
+        if re.search(r"\b(?:turn\s+(?:it\s+)?up|louder|raise\s+(?:the\s+)?volume|increase\s+(?:the\s+)?volume|volume\s+up)\b", t):
             cur = self._applescript("output volume of (get volume settings)")
             new_vol = min(100, int(cur or 50) + 15)
             self._applescript(f"set volume output volume {new_vol}")
             return f"Volume at {new_vol} percent."
 
-        if re.search(r"\b(?:turn\s+down|quieter|lower\s+(?:the\s+)?volume|decrease\s+(?:the\s+)?volume|volume\s+down)\b", t):
+        if re.search(r"\b(?:turn\s+(?:it\s+)?down|quieter|lower\s+(?:the\s+)?volume|decrease\s+(?:the\s+)?volume|volume\s+down)\b", t):
             cur = self._applescript("output volume of (get volume settings)")
             new_vol = max(0, int(cur or 50) - 15)
             self._applescript(f"set volume output volume {new_vol}")
@@ -994,6 +1000,11 @@ class VoiceAssistant:
                     target=self._timer_callback, args=(seconds, label), daemon=True
                 ).start()
                 return f"I'll remind you in {label}, Sir."
+
+        # ── Cancel timer / reminder ───────────────────────────────────────────
+        if re.search(r"\b(?:cancel|stop|clear|disable)\s+(?:the\s+)?(?:timer|alarm|reminder)\b", t):
+            self._cancel_timer.set()
+            return "Timer cancelled, Sir."
 
         # ── Open app ──────────────────────────────────────────────────────────
         m = re.search(
