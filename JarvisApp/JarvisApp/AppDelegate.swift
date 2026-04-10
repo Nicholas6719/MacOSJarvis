@@ -7,7 +7,8 @@ import AVFoundation
 
 final class WaveformIconView: NSView {
 
-    private let barColor = NSColor(red: 0.0, green: 0.706, blue: 1.0, alpha: 1.0)
+    private let blueColor = NSColor(red: 0.0, green: 0.706, blue: 1.0, alpha: 1.0)
+    private let grayColor = NSColor.gray.withAlphaComponent(0.6)
     private let barWidth: CGFloat  = 3
     private let barGap: CGFloat    = 3
     private let idleHeights: [CGFloat] = [6, 10, 6]
@@ -15,11 +16,13 @@ final class WaveformIconView: NSView {
     private var barHeights: [CGFloat] = [6, 10, 6]
     private var phase: Double = 0
     private var animTimer: Timer?
+    var isPaused: Bool = false
 
     override var isFlipped: Bool { false }
 
     override func draw(_ dirtyRect: NSRect) {
-        barColor.setFill()
+        let color = isPaused ? grayColor : blueColor
+        color.setFill()
         let totalWidth = 3 * barWidth + 2 * barGap   // 15
         let startX = (bounds.width - totalWidth) / 2
 
@@ -51,6 +54,14 @@ final class WaveformIconView: NSView {
         animTimer = nil
         barHeights = idleHeights
         phase = 0
+        needsDisplay = true
+    }
+
+    func setPaused(_ paused: Bool) {
+        isPaused = paused
+        if paused {
+            stopAnimating()
+        }
         needsDisplay = true
     }
 }
@@ -118,6 +129,8 @@ struct WKWebViewRepresentable: NSViewRepresentable {
 final class JarvisWebView: WKWebView {
     override var mouseDownCanMoveWindow: Bool { true }
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        // Don't suppress if this is the orb resize context menu (has items with tags/targets)
+        if menu.items.contains(where: { $0.target != nil }) { return }
         menu.removeAllItems()
     }
 }
@@ -146,6 +159,15 @@ struct OrbContentView: View {
     }
 }
 
+// MARK: - Menu state enum
+
+enum JarvisMenuState {
+    case starting
+    case ready
+    case paused
+    case error
+}
+
 // MARK: - AppDelegate
 
 @MainActor
@@ -159,6 +181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var logsWindow: NSWindow?
     private var waveformView = WaveformIconView(frame: NSRect(x: 0, y: 0, width: 28, height: 18))
     private var isMuted = false
+    private var isPaused = false
     private var phaseTimer: Timer?
     private var lastObservedPhase: BackendManager.Phase = .idle
 
@@ -179,11 +202,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
-        orbWindow?.orderFrontRegardless()
+        if !isPaused { orbWindow?.orderFrontRegardless() }
     }
 
     func applicationWillResignActive(_ notification: Notification) {
-        orbWindow?.orderFrontRegardless()
+        if !isPaused { orbWindow?.orderFrontRegardless() }
     }
 
     // MARK: - Menubar
@@ -203,6 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let menu = NSMenu()
 
+        // 1. Header
         let titleItem = NSMenuItem(title: "Jarvis", action: nil, keyEquivalent: "")
         titleItem.attributedTitle = NSAttributedString(
             string: "Jarvis",
@@ -211,34 +235,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         titleItem.isEnabled = false
         menu.addItem(titleItem)
 
+        // 2. Separator
         menu.addItem(.separator())
 
-        let statusItem = NSMenuItem(title: "● Idle", action: nil, keyEquivalent: "")
-        statusItem.tag = 100
-        statusItem.isEnabled = false
-        menu.addItem(statusItem)
+        // 3. Status indicator
+        let statusMenuItem = NSMenuItem(title: "● Starting…", action: nil, keyEquivalent: "")
+        statusMenuItem.tag = 100
+        statusMenuItem.isEnabled = false
+        menu.addItem(statusMenuItem)
 
+        // 4. Separator
         menu.addItem(.separator())
 
+        // 5. Pause / Resume
+        let pauseItem = NSMenuItem(title: "Pause Jarvis", action: #selector(togglePause), keyEquivalent: "")
+        pauseItem.tag = 300
+        pauseItem.target = self
+        pauseItem.isEnabled = false  // disabled while starting
+        menu.addItem(pauseItem)
+
+        // 6. Restart
+        let restartItem = NSMenuItem(title: "Restart Jarvis", action: #selector(restartJarvis), keyEquivalent: "")
+        restartItem.target = self
+        menu.addItem(restartItem)
+
+        // 7. Separator
+        menu.addItem(.separator())
+
+        // 8. Mute
         let muteItem = NSMenuItem(title: "Mute", action: #selector(toggleMute), keyEquivalent: "")
         muteItem.tag = 200
         muteItem.target = self
         menu.addItem(muteItem)
 
-        let restartItem = NSMenuItem(title: "Restart Jarvis", action: #selector(restartJarvis), keyEquivalent: "")
-        restartItem.target = self
-        menu.addItem(restartItem)
-
+        // 9. Show Logs
         let logsItem = NSMenuItem(title: "Show Logs", action: #selector(showLogs), keyEquivalent: "")
         logsItem.target = self
         menu.addItem(logsItem)
 
+        // 10. Show Orb
+        let showOrbItem = NSMenuItem(title: "Show Orb", action: #selector(showOrb), keyEquivalent: "")
+        showOrbItem.tag = 400
+        showOrbItem.target = self
+        menu.addItem(showOrbItem)
+
+        // 11. Separator
         menu.addItem(.separator())
 
+        // 12. Quit
         let quitItem = NSMenuItem(title: "Quit Jarvis", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quitItem)
 
         self.statusItem?.menu = menu
+    }
+
+    // MARK: - Menu state helper
+
+    private func updateMenuForState(_ state: JarvisMenuState) {
+        guard let menu = statusItem?.menu else { return }
+
+        if let item = menu.item(withTag: 100) {
+            switch state {
+            case .starting: item.title = "● Starting…"
+            case .ready:    item.title = "● Active"
+            case .paused:   item.title = "● Paused"
+            case .error:    item.title = "● Error"
+            }
+        }
+
+        if let pauseItem = menu.item(withTag: 300) {
+            switch state {
+            case .starting:
+                pauseItem.title = "Pause Jarvis"
+                pauseItem.isEnabled = false
+            case .ready:
+                pauseItem.title = "Pause Jarvis"
+                pauseItem.isEnabled = true
+            case .paused:
+                pauseItem.title = "Resume Jarvis"
+                pauseItem.isEnabled = true
+            case .error:
+                pauseItem.title = "Pause Jarvis"
+                pauseItem.isEnabled = false
+            }
+        }
     }
 
     // MARK: - Orb window
@@ -270,8 +350,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         .environmentObject(backendManager)
 
         panel.contentView = NSHostingView(rootView: orbContent)
+        panel.contentView?.menu = makeOrbContextMenu()
         orbWindow = panel
         panel.orderFrontRegardless()
+    }
+
+    // MARK: - Orb context menu (right-click resize)
+
+    private func makeOrbContextMenu() -> NSMenu {
+        let menu = NSMenu()
+
+        let smallItem = NSMenuItem(title: "Small (280×280)", action: #selector(setOrbSmall), keyEquivalent: "")
+        smallItem.target = self
+        menu.addItem(smallItem)
+
+        let mediumItem = NSMenuItem(title: "Medium (420×420)", action: #selector(setOrbMedium), keyEquivalent: "")
+        mediumItem.target = self
+        menu.addItem(mediumItem)
+
+        let largeItem = NSMenuItem(title: "Large (560×560)", action: #selector(setOrbLarge), keyEquivalent: "")
+        largeItem.target = self
+        menu.addItem(largeItem)
+
+        menu.addItem(.separator())
+
+        let hideItem = NSMenuItem(title: "Hide Orb", action: #selector(hideOrb), keyEquivalent: "")
+        hideItem.target = self
+        menu.addItem(hideItem)
+
+        return menu
+    }
+
+    @objc private func setOrbSmall()  { resizeOrb(to: 280) }
+    @objc private func setOrbMedium() { resizeOrb(to: 420) }
+    @objc private func setOrbLarge()  { resizeOrb(to: 560) }
+
+    @objc private func hideOrb() {
+        orbWindow?.orderOut(nil)
+    }
+
+    @objc private func showOrb() {
+        orbWindow?.orderFrontRegardless()
+    }
+
+    private func resizeOrb(to size: CGFloat) {
+        guard let panel = orbWindow, let screen = NSScreen.main else { return }
+        let frame = NSRect(
+            x: screen.visibleFrame.maxX - size - 20,
+            y: screen.visibleFrame.minY + 20,
+            width: size,
+            height: size
+        )
+        panel.setFrame(frame, display: true, animate: true)
     }
 
     // MARK: - Phase observer
@@ -280,8 +410,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         phaseTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                let menu = self.statusItem?.menu
-                let statusMenuItem = menu?.item(withTag: 100)
 
                 let currentPhase = self.backendManager.phase
                 let wasReady = self.lastObservedPhase == .ready
@@ -289,27 +417,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                 switch currentPhase {
                 case .idle:
+                    if !self.isPaused {
+                        self.updateMenuForState(.starting)
+                    }
                     self.waveformView.stopAnimating()
-                    statusMenuItem?.title = "● Idle"
                 case .starting:
+                    self.updateMenuForState(.starting)
                     self.waveformView.stopAnimating()
-                    statusMenuItem?.title = "● Starting…"
                 case .ready:
-                    self.waveformView.startAnimating()
-                    statusMenuItem?.title = "● Ready"
+                    if !self.isPaused {
+                        self.updateMenuForState(.ready)
+                        self.waveformView.setPaused(false)
+                        self.waveformView.startAnimating()
+                    }
                     // Force a fresh load once when backend first becomes ready
                     if !wasReady, let url = URL(string: "http://localhost:3000") {
                         self.orbWebView?.load(URLRequest(url: url))
                     }
                 case .failed:
+                    self.updateMenuForState(.error)
                     self.waveformView.stopAnimating()
-                    statusMenuItem?.title = "● Error"
                 }
             }
         }
     }
 
     // MARK: - Menu actions
+
+    @objc private func togglePause() {
+        Task { @MainActor in
+            if self.isPaused {
+                // Resume
+                self.isPaused = false
+                self.orbWindow?.orderFrontRegardless()
+                self.backendManager.start()
+                self.updateMenuForState(.starting)
+            } else {
+                // Pause
+                self.isPaused = true
+                self.backendManager.stop()
+                self.orbWindow?.orderOut(nil)
+                self.updateMenuForState(.paused)
+                self.waveformView.setPaused(true)
+            }
+        }
+    }
 
     @objc private func toggleMute() {
         Task { @MainActor in
@@ -328,7 +480,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func restartJarvis() {
         Task { @MainActor in
+            self.isPaused = false
+            self.waveformView.setPaused(false)
             self.backendManager.restart()
+            self.updateMenuForState(.starting)
             // Give backend a head start then trigger a reload
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             if let url = URL(string: "http://localhost:3000") {
