@@ -173,7 +173,6 @@ class VoiceAssistant:
             "Keep answers brief and conversational. No bullet points or markdown.",
         )
         self._stop_speak = threading.Event()
-        self._tts_speaking = False
         self.pending_confirmation: Optional[dict] = None
 
     # ── Loading ───────────────────────────────────────────────────────────────
@@ -283,14 +282,12 @@ class VoiceAssistant:
         Uses adaptive silence: short commands cut off at 600 ms,
         longer speech (> 2.5 s) gets 950 ms — so you can finish long sentences.
         """
-        # Wait until TTS finishes so the mic doesn't pick up Jarvis's own voice
-        while self._tts_speaking:
-            time.sleep(0.05)
-
         while ws_server.is_muted():
             ws_server.set_state("idle")
             time.sleep(0.1)
 
+        # Short pause + drain so the mic doesn't pick up residual TTS audio
+        time.sleep(0.2)
         self._drain_q()
         ws_server.set_state("listening")
         print("🎤  Listening …", flush=True)
@@ -358,7 +355,6 @@ class VoiceAssistant:
 
     def speak_direct(self, text: str) -> None:
         """Speak text immediately via TTS — no LLM involved."""
-        self._tts_speaking = True
         ws_server.set_state("speaking")
         try:
             wav    = self._synthesise(text)
@@ -369,7 +365,6 @@ class VoiceAssistant:
             player.wait()
         finally:
             ws_server.set_state("idle")
-            self._tts_speaking = False
 
     def stop_speaking(self) -> None:
         self._stop_speak.set()
@@ -557,7 +552,13 @@ class VoiceAssistant:
              f'display notification "Timer complete!" with title "Jarvis" subtitle "{label}"'],
             check=False,
         )
+        # Drain the audio queue so the mic doesn't pick up the notification sound
+        time.sleep(0.3)
+        self._drain_q()
         self.speak_direct(msg)
+        # Drain again after speaking so Jarvis doesn't hear itself
+        time.sleep(0.5)
+        self._drain_q()
 
     def _handle_system_command(self, text: str) -> Optional[str]:
         """
@@ -578,7 +579,7 @@ class VoiceAssistant:
         if any(p in t for p in _SELF_SHUTDOWN_PHRASES):
             if not re.search(r"\b(?:my\s+)?(?:mac|computer)\b", t) and "music" not in t:
                 self.speak_direct("Goodbye, Sir. Shutting down.")
-                raise SystemExit(0)
+                os._exit(0)
 
         # ── FIX 2: Mac power commands (shutdown/restart/sleep Mac) ────────────
         mac_power = re.search(
@@ -630,6 +631,14 @@ class VoiceAssistant:
                 return f"Your battery is at {pct} percent {state}, Sir."
             except Exception:
                 return "I couldn't read the battery status right now, Sir."
+
+        # ── Lock screen (before open-app checks so "lock" isn't misread) ─────
+        if re.search(r"\block\b.*\b(mac|screen|computer)\b|\block\s+screen\b|\block\s+my\s+mac\b", t):
+            subprocess.run([
+                "osascript", "-e",
+                'tell application "System Events" to keystroke "q" using {command down, control down}',
+            ], check=False)
+            return "Locking your Mac, Sir."
 
         # ── System info ───────────────────────────────────────────────────────
         if re.search(r"\b(?:how\s+much\s+(?:ram|memory)|(?:free|available)\s+(?:ram|memory)|memory\s+(?:usage|left|free))\b", t):
@@ -699,16 +708,6 @@ class VoiceAssistant:
                 'tell application "System Events" to get name of first application process whose frontmost is true'
             )
             return f"You're in {app} right now, Sir."
-
-        # ── Lock screen ───────────────────────────────────────────────────────
-        if re.search(r"\block\s+(?:my\s+)?(?:mac|the\s+)?(?:screen|computer)\b", t):
-            self.speak_direct("Locking your Mac, Sir.")
-            # Cmd+Ctrl+Q is the standard macOS lock-screen shortcut (Sequoia+)
-            subprocess.run([
-                "osascript", "-e",
-                'tell application "System Events" to keystroke "q" using {command down, control down}',
-            ], check=False)
-            return None  # Already spoke before locking
 
         # ── Brightness ────────────────────────────────────────────────────────
         m_brightness = re.search(r"\b(?:set\s+)?brightness\s+(?:to\s+)?(\d{1,3})\b", t)
@@ -1103,7 +1102,6 @@ class VoiceAssistant:
         tts_t.start()
 
         first_audio_ready.wait(timeout=60)
-        self._tts_speaking = True
         stop_spin.set()
         spin_t.join()
 
@@ -1115,7 +1113,6 @@ class VoiceAssistant:
 
         player.wait()
         llm_t.join()
-        self._tts_speaking = False
         ws_server.set_state("idle")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
