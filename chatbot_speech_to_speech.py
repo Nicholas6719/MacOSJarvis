@@ -25,8 +25,10 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import pyaudio
 import sounddevice as sd
 import webrtcvad
+from openwakeword.model import Model as WakeWordModel
 
 import ws_server
 
@@ -58,6 +60,12 @@ SILENCE_CUTOFF_LONG_MS   = 950
 LONG_SPEECH_THRESHOLD_MS = 2_500   # use long cutoff after 2.5 s of speech
 
 PLAYER_BLOCKSIZE = 4_096
+
+# ── Wake word ────────────────────────────────────────────────────────────────
+WAKE_WORD_MODEL = "hey_jarvis"
+WAKE_WORD_THRESHOLD = 0.5
+CONVERSATION_TIMEOUT = 15.0
+WAKE_CHUNK_SIZE = 1280
 
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 CLAUSE_RE   = re.compile(r"(?<=[,;:])\s+")
@@ -184,6 +192,14 @@ class VoiceAssistant:
         self._tts_speaking = False
         self._cancel_timer = threading.Event()
         self.pending_confirmation: Optional[dict] = None
+
+        # Wake word state
+        self._in_conversation = False
+        self._conversation_timer: Optional[threading.Timer] = None
+        self._wake_model: Optional[WakeWordModel] = None
+        self._wake_audio = None
+        self._wake_stream = None
+        self._wake_stream_open = False
 
     # ── Loading ───────────────────────────────────────────────────────────────
 
@@ -597,6 +613,98 @@ class VoiceAssistant:
         time.sleep(0.5)
         self._drain_q()
 
+    # ── Wake word ─────────────────────────────────────────────────────────────
+
+    def _init_wake_word(self) -> None:
+        print("[WAKE] Loading hey_jarvis model...", flush=True)
+        self._wake_model = WakeWordModel(
+            wakeword_models=[WAKE_WORD_MODEL],
+            inference_framework='onnx'
+        )
+        self._wake_audio = pyaudio.PyAudio()
+        print("[WAKE] Ready — listening for 'Hey Jarvis'", flush=True)
+
+    def _open_wake_stream(self):
+        return self._wake_audio.open(
+            rate=16000,
+            channels=1,
+            format=pyaudio.paInt16,
+            input=True,
+            frames_per_buffer=WAKE_CHUNK_SIZE
+        )
+
+    def _listen_for_wake_word(self) -> bool:
+        if not self._wake_stream_open:
+            try:
+                self._wake_stream = self._open_wake_stream()
+                self._wake_stream_open = True
+            except Exception as e:
+                print(f"[WAKE] Stream error: {e}", flush=True)
+                time.sleep(0.1)
+                return False
+        try:
+            audio_data = self._wake_stream.read(
+                WAKE_CHUNK_SIZE, exception_on_overflow=False
+            )
+            audio = np.frombuffer(audio_data, dtype=np.int16)
+            prediction = self._wake_model.predict(audio)
+            score = prediction.get(WAKE_WORD_MODEL, 0)
+            if score >= WAKE_WORD_THRESHOLD:
+                self._close_wake_stream()
+                return True
+            return False
+        except Exception:
+            self._close_wake_stream()
+            time.sleep(0.01)
+            return False
+
+    def _close_wake_stream(self) -> None:
+        try:
+            if self._wake_stream is not None:
+                self._wake_stream.stop_stream()
+                self._wake_stream.close()
+                self._wake_stream = None
+        except Exception:
+            pass
+        self._wake_stream_open = False
+
+    def _cleanup_wake_word(self) -> None:
+        self._close_wake_stream()
+        try:
+            if self._wake_audio is not None:
+                self._wake_audio.terminate()
+                self._wake_audio = None
+        except Exception:
+            pass
+
+    # ── Conversation timer ───────────────────────────────────────────────────
+
+    def _start_conversation_timer(self) -> None:
+        self._cancel_conversation_timer()
+        self._conversation_timer = threading.Timer(
+            CONVERSATION_TIMEOUT,
+            self._end_conversation
+        )
+        self._conversation_timer.daemon = True
+        self._conversation_timer.start()
+
+    def _cancel_conversation_timer(self) -> None:
+        if self._conversation_timer is not None:
+            self._conversation_timer.cancel()
+            self._conversation_timer = None
+
+    def _end_conversation(self) -> None:
+        self._in_conversation = False
+        self._cancel_conversation_timer()
+        ws_server.set_state("wake")
+        print("\n[WAKE] Conversation timed out — returning to wake mode", flush=True)
+
+    def _check_lang_switch(self) -> None:
+        """Placeholder for future language-switching support."""
+        pass
+
+    # ── System commands ───────────────────────────────────────────────────────
+
     def _handle_system_command(self, text: str) -> Optional[str]:
         """
         Check whether `text` is a local system command.
@@ -617,6 +725,14 @@ class VoiceAssistant:
             if not re.search(r"\b(?:my\s+)?(?:mac|computer)\b", t) and "music" not in t:
                 self.speak_direct("Going to sleep, Sir.")
                 raise JarvisPauseRequest()
+
+        # ── Return to wake mode ──────────────────────────────────────────────
+        if re.search(
+            r"\b(?:return\s+to\s+wake\s+mode|go\s+to\s+sleep|wake\s+mode|"
+            r"stop\s+listening|back\s+to\s+sleep)\b", t
+        ):
+            self._end_conversation()
+            return "Going to sleep."
 
         # ── FIX 2: Mac power commands (shutdown/restart/sleep Mac) ────────────
         mac_power = re.search(
@@ -1177,77 +1293,123 @@ class VoiceAssistant:
 
     def run(self) -> None:
         print("\n" + "═" * 58)
-        print("  🟢  Voice assistant ready — just speak!")
+        print("  🟢  Jarvis ready — say 'Hey Jarvis' to begin")
         print("  Open http://localhost:3000 to see the UI")
         print("  Press Ctrl+C to quit")
         print("═" * 58 + "\n")
 
+        self._init_wake_word()
+        ws_server.set_state("wake")
+
         while True:
             try:
+                self._check_lang_switch()
+
                 if ws_server.is_muted():
                     ws_server.set_state("idle")
                     time.sleep(0.1)
                     continue
 
+                if not self._in_conversation:
+                    # WAKE MODE: listen for wake word
+                    detected = self._listen_for_wake_word()
+                    if detected:
+                        self._in_conversation = True
+                        self._start_conversation_timer()
+                        ws_server.set_state("listening")
+                        print(
+                            "\n[WAKE] Wake word detected — entering conversation mode",
+                            flush=True
+                        )
+                    continue
+
+                # CONVERSATION MODE: full voice pipeline
+                # Check pending Mac power confirmation first
+                if (self.pending_confirmation is not None):
+                    action = self.pending_confirmation.get('action')
+                    audio = self.record_audio()
+                    if not audio:
+                        self._start_conversation_timer()
+                        continue
+                    response_text = self.transcribe(audio)
+                    if not response_text:
+                        self._start_conversation_timer()
+                        continue
+                    print(f"You: {response_text}")
+                    t_conf = response_text.lower().strip()
+                    if re.search(r"\b(?:yes|yeah|confirm|do\s+it|sure)\b", t_conf):
+                        self.pending_confirmation = None
+                        if action == "shutdown":
+                            self.speak_direct("Shutting down your Mac now.")
+                            subprocess.run(
+                                ["osascript", "-e",
+                                 'tell application "System Events" to shut down'],
+                                check=False
+                            )
+                        elif action == "restart":
+                            self.speak_direct("Restarting your Mac now.")
+                            subprocess.run(
+                                ["osascript", "-e",
+                                 'tell application "System Events" to restart'],
+                                check=False
+                            )
+                        elif action == "sleep":
+                            self.speak_direct("Putting your Mac to sleep.")
+                            subprocess.run(["pmset", "sleepnow"], check=False)
+                    else:
+                        self.pending_confirmation = None
+                        self.speak_direct("Cancelled.")
+                    self._start_conversation_timer()
+                    continue
+
                 audio = self.record_audio()
                 if not audio:
+                    self._start_conversation_timer()
                     continue
-
-                user_input = self.transcribe(audio)
-                if not user_input:
-                    print("  (Didn't catch that — try again)\n")
-                    continue
-
-                print(f"You: {user_input}")
-
-                # ── FIX 2: Check pending Mac power confirmation ───────────────
-                if self.pending_confirmation is not None:
-                    confirm_t = user_input.lower().strip()
-                    action = self.pending_confirmation["action"]
-                    cmd = self.pending_confirmation["cmd"]
-                    self.pending_confirmation = None  # clear regardless
-                    if re.search(r"\b(?:yes|yeah|confirm|do\s+it)\b", confirm_t):
-                        _confirm_msg = {"shut down": "Shutting down", "restart": "Restarting", "sleep": "Putting to sleep"}
-                        self.speak_direct(f"Okay, Sir. {_confirm_msg[cmd]} your Mac now.")
-                        if cmd == "shut down":
-                            subprocess.run(["osascript", "-e", 'tell application "System Events" to shut down'], check=False)
-                        elif cmd == "restart":
-                            subprocess.run(["osascript", "-e", 'tell application "System Events" to restart'], check=False)
-                        else:
-                            subprocess.run(["pmset", "sleepnow"], check=False)
-                        continue
-                    else:
-                        print("System: Cancelled, Sir.")
-                        self.speak_direct("Cancelled, Sir.")
-                        continue
-
-                # Clipboard augmentation (before system-command check)
-                augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
-
-                # System command (direct execution) or LLM
-                sys_response = self._handle_system_command(user_input)
-                if sys_response:
-                    print(f"System: {sys_response}")
-                    self.speak_direct(sys_response)
-                else:
-                    self.handle_turn(augmented_input)
-                    # Copy LLM response back to clipboard when requested
-                    if is_clipboard and self.history:
-                        last = self.history[-1].get("content", "")
-                        if last:
-                            self._copy_to_clipboard(last)
-                            print("📋  Response copied to clipboard.", flush=True)
-
-                print()
 
             except KeyboardInterrupt:
-                print("\nGoodbye, Sir.")
+                print("\nGoodbye.")
+                self._cancel_conversation_timer()
+                self._cleanup_wake_word()
+                ws_server.set_state("idle")
+                break
+            except JarvisPauseRequest:
+                self._in_conversation = False
+                self._cancel_conversation_timer()
+                self._cleanup_wake_word()
                 ws_server.set_state("idle")
                 break
 
-            except JarvisPauseRequest:
-                ws_server.set_state("idle")
-                break
+            user_input = self.transcribe(audio)
+            if not user_input:
+                print("  (Didn't catch that — try again)\n")
+                self._start_conversation_timer()
+                continue
+
+            print(f"You: {user_input}")
+
+            # Reset conversation timer on each successful interaction
+            self._start_conversation_timer()
+
+            # Clipboard augmentation
+            augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
+
+            # System command or LLM
+            sys_response = self._handle_system_command(user_input)
+            if sys_response:
+                print(f"System: {sys_response}")
+                self.speak_direct(sys_response)
+            else:
+                self.handle_turn(augmented_input)
+
+            # Copy LLM response to clipboard if requested
+            if is_clipboard and self.history:
+                last = self.history[-1].get("content", "")
+                if last:
+                    self._copy_to_clipboard(last)
+                    print("📋  Response copied to clipboard.", flush=True)
+
+            print()
 
 
 if __name__ == "__main__":

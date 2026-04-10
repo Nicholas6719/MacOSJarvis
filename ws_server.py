@@ -126,7 +126,7 @@ def is_muted() -> bool:
 
 def get_status() -> dict[str, str | bool]:
     with _state_lock:
-        return {"state": _current_state, "muted": _muted}
+        return {"status": "ok", "state": _current_state, "muted": _muted}
 
 
 def _cors_end_headers(handler: http.server.BaseHTTPRequestHandler) -> None:

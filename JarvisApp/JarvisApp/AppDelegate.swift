@@ -9,6 +9,7 @@ final class WaveformIconView: NSView {
 
     private let blueColor = NSColor(red: 0.0, green: 0.706, blue: 1.0, alpha: 1.0)
     private let grayColor = NSColor.gray.withAlphaComponent(0.6)
+    private let amberColor = NSColor(red: 1.0, green: 0.75, blue: 0.0, alpha: 1.0)
     private let barWidth: CGFloat  = 3
     private let barGap: CGFloat    = 3
     private let idleHeights: [CGFloat] = [6, 10, 6]
@@ -17,17 +18,37 @@ final class WaveformIconView: NSView {
     private var phase: Double = 0
     private var animTimer: Timer?
     var isPaused: Bool = false
+    var isWakeMode: Bool = false
+    var wakePhase: Double = 0.0
+    var wakeTimer: Timer?
 
     override var isFlipped: Bool { false }
 
     override func draw(_ dirtyRect: NSRect) {
-        let color = isPaused ? grayColor : blueColor
+        let color: NSColor
+        let heights: [CGFloat]
+
+        if isWakeMode {
+            color = amberColor
+            heights = [
+                5 + 4 * CGFloat(sin(wakePhase)),
+                7 + 4 * CGFloat(sin(wakePhase + 1.0)),
+                5 + 4 * CGFloat(sin(wakePhase + 2.0))
+            ]
+        } else if isPaused {
+            color = grayColor
+            heights = [6, 10, 6]
+        } else {
+            color = blueColor
+            heights = barHeights
+        }
+
         color.setFill()
         let totalWidth = 3 * barWidth + 2 * barGap   // 15
         let startX = (bounds.width - totalWidth) / 2
 
         for i in 0..<3 {
-            let h = barHeights[i]
+            let h = heights[i]
             let x = startX + CGFloat(i) * (barWidth + barGap)
             let y = (bounds.height - h) / 2
             let rect = NSRect(x: x, y: y, width: barWidth, height: h)
@@ -52,6 +73,9 @@ final class WaveformIconView: NSView {
     func stopAnimating() {
         animTimer?.invalidate()
         animTimer = nil
+        wakeTimer?.invalidate()
+        wakeTimer = nil
+        wakePhase = 0.0
         barHeights = idleHeights
         phase = 0
         needsDisplay = true
@@ -63,6 +87,29 @@ final class WaveformIconView: NSView {
             stopAnimating()
         }
         needsDisplay = true
+    }
+
+    func setWakeMode(_ wake: Bool) {
+        isWakeMode = wake
+        if wake {
+            isPaused = false
+            animTimer?.invalidate()
+            animTimer = nil
+            wakeTimer?.invalidate()
+            wakeTimer = Timer.scheduledTimer(
+                withTimeInterval: 0.12,
+                repeats: true
+            ) { [weak self] _ in
+                guard let self = self else { return }
+                self.wakePhase += 0.04
+                self.needsDisplay = true
+            }
+        } else {
+            wakeTimer?.invalidate()
+            wakeTimer = nil
+            wakePhase = 0.0
+            needsDisplay = true
+        }
     }
 }
 
@@ -191,6 +238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupOrbWindow()
         backendManager.start()
         startPhaseObserver()
+        startStatePoller()
         requestMicrophonePermission()
     }
 
@@ -388,6 +436,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.waveformView.stopAnimating()
                 }
             }
+        }
+    }
+
+    // MARK: - State poller (reads backend state via HTTP)
+
+    private func startStatePoller() {
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            guard let url = URL(string: "http://localhost:3000/api/status") else { return }
+            URLSession.shared.dataTask(with: url) { data, _, _ in
+                guard let data = data,
+                      let json = try? JSONSerialization.jsonObject(
+                          with: data
+                      ) as? [String: Any],
+                      let state = json["state"] as? String else { return }
+                Task { @MainActor in
+                    self.handleJarvisState(state)
+                }
+            }.resume()
+        }
+    }
+
+    @MainActor func handleJarvisState(_ state: String) {
+        switch state {
+        case "wake":
+            waveformView.setWakeMode(true)
+            orbWindow?.orderOut(nil)
+            if let item = statusItem?.menu?.item(withTag: 100) {
+                item.title = "● Wake Mode"
+            }
+
+        case "listening", "thinking", "speaking":
+            waveformView.setWakeMode(false)
+            waveformView.setPaused(false)
+            waveformView.startAnimating()
+            orbWindow?.orderFrontRegardless()
+            if let item = statusItem?.menu?.item(withTag: 100) {
+                item.title = "● Active"
+            }
+
+        case "idle":
+            if !isPaused {
+                waveformView.setWakeMode(false)
+                waveformView.stopAnimating()
+                if let item = statusItem?.menu?.item(withTag: 100) {
+                    item.title = "● Starting…"
+                }
+            }
+
+        default:
+            break
         }
     }
 
