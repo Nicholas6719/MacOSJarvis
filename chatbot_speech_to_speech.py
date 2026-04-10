@@ -10,6 +10,7 @@ System cmds: volume, apps, screenshot, timer — executed locally, no LLM
 """
 
 import collections
+import datetime
 import json
 import os
 import queue
@@ -634,12 +635,12 @@ class VoiceAssistant:
             return f"Are you sure you want me to {action} your Mac, Sir?"
 
         # ── Date & time ───────────────────────────────────────────────────────
-        if re.search(r"\b(?:what(?:'s|\s+is)\s+(?:the\s+)?(?:current\s+)?time|what\s+time\s+is\s+it)\b", t):
-            now = time.strftime("%-I:%M %p")
+        if re.search(r"\b(?:what(?:'s|\s+is)\s+(?:the\s+)?(?:current\s+)?time|what\s+time\s+is\s+it|time\s+please|tell\s+me\s+the\s+time)\b", t):
+            now = datetime.datetime.now().strftime("%-I:%M %p")
             return f"It's {now}, Sir."
 
         if re.search(r"\b(?:what(?:'s|\s+is)\s+(?:today'?s?\s+)?date|what(?:'s|\s+is)\s+today|today'?s?\s+date)\b", t):
-            today = time.strftime("%A, %B %-d")
+            today = datetime.datetime.now().strftime("%A, %B %-d")
             return f"Today is {today}, Sir."
 
         # ── Battery status ────────────────────────────────────────────────────
