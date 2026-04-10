@@ -315,9 +315,6 @@ class VoiceAssistant:
             ws_server.set_state("idle")
             time.sleep(0.1)
 
-        # Pause conversation timer while user is speaking
-        if self._in_conversation:
-            self._cancel_conversation_timer()
         # Short pause + drain so the mic doesn't pick up residual TTS audio
         time.sleep(0.2)
         self._drain_q()
@@ -1402,20 +1399,20 @@ class VoiceAssistant:
 
                 audio = self.record_audio()
                 if not audio:
-                    # User said nothing — restart the inactivity timer
-                    if self._in_conversation:
-                        self._start_conversation_timer()
-                    continue
+                    continue  # Timer is already running — don't touch it
+
+                # User said something — cancel inactivity timer while we process
+                self._cancel_conversation_timer()
 
                 user_input = self.transcribe(audio)
                 if not user_input:
                     print("  (Didn't catch that — try again)\n")
+                    # Restart timer since transcription failed
+                    if self._in_conversation:
+                        self._start_conversation_timer()
                     continue
 
                 print(f"You: {user_input}")
-
-                # Reset conversation timer on each successful interaction
-                self._start_conversation_timer()
 
                 # Clipboard augmentation
                 augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
