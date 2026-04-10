@@ -31,9 +31,10 @@ final class BackendManager: ObservableObject {
 
     // MARK: - Published
 
-    @Published var phase:   Phase  = .idle
-    @Published var logs:    String = ""   // backend runtime logs
-    @Published var lastSTT: String = ""   // latest voice transcription
+    @Published var phase:        Phase  = .idle
+    @Published var logs:         String = ""   // backend runtime logs
+    @Published var lastSTT:      String = ""   // latest voice transcription
+    @Published var lastExitCode: Int32  = -1   // exit code of last backend run
 
     // MARK: - Private
 
@@ -107,6 +108,7 @@ final class BackendManager: ObservableObject {
             errPipe.fileHandleForReading.readabilityHandler = nil
             let code = p.terminationStatus
             Task { @MainActor [weak self] in
+                self?.lastExitCode = code
                 self?.process = nil
                 self?.appendLog("\n[Backend exited — code \(code)]\n")
                 if case .ready = self?.phase { self?.phase = .idle }

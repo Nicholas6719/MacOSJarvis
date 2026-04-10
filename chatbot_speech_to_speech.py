@@ -30,6 +30,12 @@ import webrtcvad
 
 import ws_server
 
+
+class JarvisPauseRequest(Exception):
+    """Raised when the user asks Jarvis to go to sleep via voice command."""
+    pass
+
+
 # ── Data directory ────────────────────────────────────────────────────────────
 # When running inside the macOS app, the Swift wrapper sets JARVIS_DATA_DIR to
 # ~/Library/Application Support/Jarvis/ so models and config survive app updates.
@@ -609,8 +615,8 @@ class VoiceAssistant:
         )
         if any(p in t for p in _SELF_SHUTDOWN_PHRASES):
             if not re.search(r"\b(?:my\s+)?(?:mac|computer)\b", t) and "music" not in t:
-                self.speak_direct("Goodbye, Sir. Shutting down.")
-                os._exit(0)
+                self.speak_direct("Going to sleep, Sir.")
+                raise JarvisPauseRequest()
 
         # ── FIX 2: Mac power commands (shutdown/restart/sleep Mac) ────────────
         mac_power = re.search(
@@ -1187,57 +1193,61 @@ class VoiceAssistant:
                 if not audio:
                     continue
 
+                user_input = self.transcribe(audio)
+                if not user_input:
+                    print("  (Didn't catch that — try again)\n")
+                    continue
+
+                print(f"You: {user_input}")
+
+                # ── FIX 2: Check pending Mac power confirmation ───────────────
+                if self.pending_confirmation is not None:
+                    confirm_t = user_input.lower().strip()
+                    action = self.pending_confirmation["action"]
+                    cmd = self.pending_confirmation["cmd"]
+                    self.pending_confirmation = None  # clear regardless
+                    if re.search(r"\b(?:yes|yeah|confirm|do\s+it)\b", confirm_t):
+                        _confirm_msg = {"shut down": "Shutting down", "restart": "Restarting", "sleep": "Putting to sleep"}
+                        self.speak_direct(f"Okay, Sir. {_confirm_msg[cmd]} your Mac now.")
+                        if cmd == "shut down":
+                            subprocess.run(["osascript", "-e", 'tell application "System Events" to shut down'], check=False)
+                        elif cmd == "restart":
+                            subprocess.run(["osascript", "-e", 'tell application "System Events" to restart'], check=False)
+                        else:
+                            subprocess.run(["pmset", "sleepnow"], check=False)
+                        continue
+                    else:
+                        print("System: Cancelled, Sir.")
+                        self.speak_direct("Cancelled, Sir.")
+                        continue
+
+                # Clipboard augmentation (before system-command check)
+                augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
+
+                # System command (direct execution) or LLM
+                sys_response = self._handle_system_command(user_input)
+                if sys_response:
+                    print(f"System: {sys_response}")
+                    self.speak_direct(sys_response)
+                else:
+                    self.handle_turn(augmented_input)
+                    # Copy LLM response back to clipboard when requested
+                    if is_clipboard and self.history:
+                        last = self.history[-1].get("content", "")
+                        if last:
+                            self._copy_to_clipboard(last)
+                            print("📋  Response copied to clipboard.", flush=True)
+
+                print()
+
             except KeyboardInterrupt:
                 print("\nGoodbye, Sir.")
                 ws_server.set_state("idle")
                 break
 
-            user_input = self.transcribe(audio)
-            if not user_input:
-                print("  (Didn't catch that — try again)\n")
-                continue
-
-            print(f"You: {user_input}")
-
-            # ── FIX 2: Check pending Mac power confirmation ───────────────
-            if self.pending_confirmation is not None:
-                confirm_t = user_input.lower().strip()
-                action = self.pending_confirmation["action"]
-                cmd = self.pending_confirmation["cmd"]
-                self.pending_confirmation = None  # clear regardless
-                if re.search(r"\b(?:yes|yeah|confirm|do\s+it)\b", confirm_t):
-                    _confirm_msg = {"shut down": "Shutting down", "restart": "Restarting", "sleep": "Putting to sleep"}
-                    self.speak_direct(f"Okay, Sir. {_confirm_msg[cmd]} your Mac now.")
-                    if cmd == "shut down":
-                        subprocess.run(["osascript", "-e", 'tell application "System Events" to shut down'], check=False)
-                    elif cmd == "restart":
-                        subprocess.run(["osascript", "-e", 'tell application "System Events" to restart'], check=False)
-                    else:
-                        subprocess.run(["pmset", "sleepnow"], check=False)
-                    continue
-                else:
-                    print("System: Cancelled, Sir.")
-                    self.speak_direct("Cancelled, Sir.")
-                    continue
-
-            # Clipboard augmentation (before system-command check)
-            augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
-
-            # System command (direct execution) or LLM
-            sys_response = self._handle_system_command(user_input)
-            if sys_response:
-                print(f"System: {sys_response}")
-                self.speak_direct(sys_response)
-            else:
-                self.handle_turn(augmented_input)
-                # Copy LLM response back to clipboard when requested
-                if is_clipboard and self.history:
-                    last = self.history[-1].get("content", "")
-                    if last:
-                        self._copy_to_clipboard(last)
-                        print("📋  Response copied to clipboard.", flush=True)
-
-            print()
+            except JarvisPauseRequest:
+                ws_server.set_state("idle")
+                break
 
 
 if __name__ == "__main__":

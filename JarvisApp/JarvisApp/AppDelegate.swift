@@ -129,8 +129,6 @@ struct WKWebViewRepresentable: NSViewRepresentable {
 final class JarvisWebView: WKWebView {
     override var mouseDownCanMoveWindow: Bool { true }
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
-        // Don't suppress if this is the orb resize context menu (has items with tags/targets)
-        if menu.items.contains(where: { $0.target != nil }) { return }
         menu.removeAllItems()
     }
 }
@@ -273,13 +271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         logsItem.target = self
         menu.addItem(logsItem)
 
-        // 10. Show Orb
-        let showOrbItem = NSMenuItem(title: "Show Orb", action: #selector(showOrb), keyEquivalent: "")
-        showOrbItem.tag = 400
-        showOrbItem.target = self
-        menu.addItem(showOrbItem)
-
-        // 11. Separator
+        // 10. Separator
         menu.addItem(.separator())
 
         // 12. Quit
@@ -350,58 +342,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         .environmentObject(backendManager)
 
         panel.contentView = NSHostingView(rootView: orbContent)
-        panel.contentView?.menu = makeOrbContextMenu()
         orbWindow = panel
         panel.orderFrontRegardless()
-    }
-
-    // MARK: - Orb context menu (right-click resize)
-
-    private func makeOrbContextMenu() -> NSMenu {
-        let menu = NSMenu()
-
-        let smallItem = NSMenuItem(title: "Small (280×280)", action: #selector(setOrbSmall), keyEquivalent: "")
-        smallItem.target = self
-        menu.addItem(smallItem)
-
-        let mediumItem = NSMenuItem(title: "Medium (420×420)", action: #selector(setOrbMedium), keyEquivalent: "")
-        mediumItem.target = self
-        menu.addItem(mediumItem)
-
-        let largeItem = NSMenuItem(title: "Large (560×560)", action: #selector(setOrbLarge), keyEquivalent: "")
-        largeItem.target = self
-        menu.addItem(largeItem)
-
-        menu.addItem(.separator())
-
-        let hideItem = NSMenuItem(title: "Hide Orb", action: #selector(hideOrb), keyEquivalent: "")
-        hideItem.target = self
-        menu.addItem(hideItem)
-
-        return menu
-    }
-
-    @objc private func setOrbSmall()  { resizeOrb(to: 280) }
-    @objc private func setOrbMedium() { resizeOrb(to: 420) }
-    @objc private func setOrbLarge()  { resizeOrb(to: 560) }
-
-    @objc private func hideOrb() {
-        orbWindow?.orderOut(nil)
-    }
-
-    @objc private func showOrb() {
-        orbWindow?.orderFrontRegardless()
-    }
-
-    private func resizeOrb(to size: CGFloat) {
-        guard let panel = orbWindow, let screen = NSScreen.main else { return }
-        let frame = NSRect(
-            x: screen.visibleFrame.maxX - size - 20,
-            y: screen.visibleFrame.minY + 20,
-            width: size,
-            height: size
-        )
-        panel.setFrame(frame, display: true, animate: true)
     }
 
     // MARK: - Phase observer
@@ -417,7 +359,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                 switch currentPhase {
                 case .idle:
-                    if !self.isPaused {
+                    // Detect voice-initiated pause: backend exited cleanly (code 0)
+                    // while we were previously running (wasReady) and not already paused
+                    if wasReady, self.backendManager.lastExitCode == 0, !self.isPaused {
+                        self.isPaused = true
+                        self.orbWindow?.orderOut(nil)
+                        self.waveformView.setPaused(true)
+                        self.updateMenuForState(.paused)
+                    } else if !self.isPaused {
                         self.updateMenuForState(.starting)
                     }
                     self.waveformView.stopAnimating()
