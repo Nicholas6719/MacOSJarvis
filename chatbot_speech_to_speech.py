@@ -1402,6 +1402,9 @@ class VoiceAssistant:
 
                 audio = self.record_audio()
                 if not audio:
+                    # User said nothing — restart the inactivity timer
+                    if self._in_conversation:
+                        self._start_conversation_timer()
                     continue
 
                 user_input = self.transcribe(audio)

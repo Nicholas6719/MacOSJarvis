@@ -478,8 +478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
         case "idle":
-            if !isPaused {
-                waveformView.setWakeMode(false)
+            if !isPaused && !waveformView.isWakeMode {
                 waveformView.stopAnimating()
                 if let item = statusItem?.menu?.item(withTag: 100) {
                     item.title = "● Starting…"
