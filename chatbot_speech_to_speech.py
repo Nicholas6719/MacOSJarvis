@@ -68,6 +68,7 @@ CONVERSATION_TIMEOUT = 15.0
 WAKE_CHUNK_SIZE = 1280
 STARTUP_MODE = os.environ.get("JARVIS_STARTUP_MODE", "wake")
 WAKE_MODE_SENTINEL = "__WAKE_MODE__"
+NOISE_FLOOR_RMS = 150  # Minimum RMS energy to consider audio as speech
 
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 CLAUSE_RE   = re.compile(r"(?<=[,;:])\s+")
@@ -372,6 +373,13 @@ class VoiceAssistant:
                 else:
                     # Not speaking yet — keep recent frames for pre-roll
                     pre_roll.append(frame)
+        # Check RMS energy — ignore if it's just background noise
+        audio_np = np.frombuffer(buf, dtype=np.int16)
+        if len(audio_np) == 0:
+            return b""
+        rms = np.sqrt(np.mean(audio_np.astype(np.float32) ** 2))
+        if rms < NOISE_FLOOR_RMS:
+            return b""
         return buf
 
     # ── STT ───────────────────────────────────────────────────────────────────
