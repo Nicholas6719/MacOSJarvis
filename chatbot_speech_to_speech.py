@@ -9,6 +9,7 @@ Pipeline   : LLM-stream → TTS-stream → SeamlessPlayer (zero-gap audio)
 System cmds: volume, apps, screenshot, timer — executed locally, no LLM
 """
 
+import collections
 import json
 import os
 import queue
@@ -295,6 +296,9 @@ class VoiceAssistant:
         silence_ms = 0
         speech_ms  = 0
         speaking   = False
+        # Rolling buffer of recent frames so the first syllable isn't clipped.
+        # 5 frames × 30 ms = 150 ms of pre-roll audio kept before VAD triggers.
+        pre_roll: collections.deque[bytes] = collections.deque(maxlen=5)
 
         def _cb(indata: np.ndarray, *_) -> None:
             self._audio_q.put(bytes(indata))
@@ -311,6 +315,9 @@ class VoiceAssistant:
                     return b""
                 frame = self._audio_q.get()
                 if self.vad.is_speech(frame, SAMPLE_RATE):
+                    if not speaking:
+                        # Prepend buffered frames so the start of speech is preserved
+                        buf = b"".join(pre_roll)
                     buf       += frame
                     silence_ms = 0
                     speaking   = True
@@ -325,6 +332,9 @@ class VoiceAssistant:
                     )
                     if silence_ms > cutoff:
                         break
+                else:
+                    # Not speaking yet — keep recent frames for pre-roll
+                    pre_roll.append(frame)
         return buf
 
     # ── STT ───────────────────────────────────────────────────────────────────
@@ -340,7 +350,7 @@ class VoiceAssistant:
             vad_filter=True,
             vad_parameters={
                 "min_silence_duration_ms": 300,
-                "speech_pad_ms": 200,           # keep a bit of audio around speech edges
+                "speech_pad_ms": 400,           # keep a bit of audio around speech edges
             },
         )
         return " ".join(s.text.strip() for s in segments).strip()
@@ -922,6 +932,18 @@ class VoiceAssistant:
                     target=self._timer_callback, args=(seconds, label), daemon=True
                 ).start()
                 return f"Timer set for {label}, Sir."
+
+        # Fallback: numberless patterns like "second timer", "quick timer"
+        m_fallback = re.search(r"\b(quick|second|minute|hour)s?\s+timer\b", t)
+        if m_fallback:
+            unit_word = m_fallback.group(1)
+            defaults = {"quick": 30, "second": 30, "minute": 60, "hour": 3600}
+            seconds = defaults.get(unit_word, 30)
+            label = f"{seconds} seconds" if seconds < 60 else f"{seconds // 60} minute"
+            threading.Thread(
+                target=self._timer_callback, args=(seconds, label), daemon=True
+            ).start()
+            return f"Timer set for {label}, Sir."
 
         # ── Reminder (flexible phrasing + word numbers) ───────────────────────
         # "remind me in 5 minutes", "remind me in an hour",
