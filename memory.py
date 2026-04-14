@@ -907,23 +907,102 @@ class MemoryManager:
 
     def _parse_date_range_from_text(self, text: str):
         """Extract a (start_iso, end_iso) UTC window from a user utterance if
-        the text references a month, optionally with a year and/or a day-of-month.
+        the text references a month (optionally with year/day) OR a supported
+        relative phrase like 'yesterday', 'last week', 'this morning'.
 
-        Returns a tuple (start, end) or None. Only handles absolute dates —
-        no relative phrases like 'yesterday' or 'last week'.
+        Returns a tuple (start, end) or None on failure.
 
-        Supported shapes:
+        Absolute shapes:
           - 'April 2026'            → whole month of April 2026
           - 'April'                 → whole month of April in the current year
-          - 'April 14'              → single day, 2026-04-14 (or current year)
+          - 'April 14'              → single day, current year
           - 'April 14th 2026'       → single day
           - 'on April 14th'         → single day
+
+        Relative shapes (all evaluated against datetime.utcnow()):
+          - 'this morning'          → today 00:00–11:59:59 UTC
+          - 'this afternoon'        → today 12:00–17:59:59 UTC
+          - 'this evening' / 'tonight' → today 18:00–23:59:59 UTC
+          - 'today'                 → today 00:00–23:59:59 UTC
+          - 'yesterday'             → yesterday 00:00–23:59:59 UTC
+          - 'this week'             → Monday 00:00 → today 23:59:59 UTC
+          - 'last week'             → previous Mon–Sun 00:00–23:59:59 UTC
+          - 'this month'            → month's 1st 00:00 → today 23:59:59 UTC
+          - 'last month'            → previous month 1st–last 00:00–23:59:59
+          - 'this year'             → Jan 1 00:00 → today 23:59:59 UTC
+          - 'last year'             → previous Jan 1 – Dec 31 00:00–23:59:59
+          - 'recently' / 'lately'   → 7 days ago 00:00 → today 23:59:59 UTC
         """
         try:
             if not text:
                 return None
             lowered = text.lower()
-            # Month
+            now = datetime.datetime.utcnow()
+            today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+            def _iso(start: datetime.datetime, end: datetime.datetime):
+                return (start.isoformat(), end.isoformat())
+
+            # ── Relative phrases (checked FIRST) ─────────────────────────
+            # Order matters: longer / more specific phrases before shorter
+            # ones so e.g. "this morning" wins over "this" fragments.
+            if "this morning" in lowered:
+                return _iso(today, today.replace(hour=11, minute=59, second=59))
+            if "this afternoon" in lowered:
+                return _iso(
+                    today.replace(hour=12),
+                    today.replace(hour=17, minute=59, second=59),
+                )
+            if "this evening" in lowered or "tonight" in lowered:
+                return _iso(
+                    today.replace(hour=18),
+                    today.replace(hour=23, minute=59, second=59),
+                )
+            if "yesterday" in lowered:
+                y = today - datetime.timedelta(days=1)
+                return _iso(y, y.replace(hour=23, minute=59, second=59))
+            if "last week" in lowered:
+                # Previous calendar week: Mon 00:00 through Sun 23:59:59.
+                this_mon = today - datetime.timedelta(days=today.weekday())
+                last_mon = this_mon - datetime.timedelta(days=7)
+                last_sun = last_mon + datetime.timedelta(days=6)
+                return _iso(
+                    last_mon, last_sun.replace(hour=23, minute=59, second=59)
+                )
+            if "this week" in lowered:
+                this_mon = today - datetime.timedelta(days=today.weekday())
+                end_today = today.replace(hour=23, minute=59, second=59)
+                return _iso(this_mon, end_today)
+            if "last month" in lowered:
+                # First day of previous month → last day of previous month.
+                first_this = today.replace(day=1)
+                last_prev = first_this - datetime.timedelta(days=1)
+                first_prev = last_prev.replace(day=1)
+                return _iso(
+                    first_prev,
+                    last_prev.replace(hour=23, minute=59, second=59),
+                )
+            if "this month" in lowered:
+                first_this = today.replace(day=1)
+                end_today = today.replace(hour=23, minute=59, second=59)
+                return _iso(first_this, end_today)
+            if "last year" in lowered:
+                y = today.year - 1
+                start = datetime.datetime(y, 1, 1, 0, 0, 0)
+                end = datetime.datetime(y, 12, 31, 23, 59, 59)
+                return _iso(start, end)
+            if "this year" in lowered:
+                start = datetime.datetime(today.year, 1, 1, 0, 0, 0)
+                end_today = today.replace(hour=23, minute=59, second=59)
+                return _iso(start, end_today)
+            if "recently" in lowered or "lately" in lowered:
+                start = today - datetime.timedelta(days=7)
+                end_today = today.replace(hour=23, minute=59, second=59)
+                return _iso(start, end_today)
+            if "today" in lowered:
+                return _iso(today, today.replace(hour=23, minute=59, second=59))
+
+            # ── Absolute month-based parsing (existing logic) ────────────
             month_names = list(_MONTHS)
             month_num = None
             month_match = re.search(
@@ -1052,6 +1131,32 @@ class MemoryManager:
                     matched_trigger = m.group(0)
                     is_date_trigger = True
 
+            # Relative date phrases (checked after absolute dates so that an
+            # explicit "in April 2026" still wins over a stray "recently").
+            # Longer phrases listed first so "this morning" beats "today".
+            relative_phrases = (
+                "this morning",
+                "this afternoon",
+                "this evening",
+                "tonight",
+                "this week",
+                "last week",
+                "this month",
+                "last month",
+                "this year",
+                "last year",
+                "yesterday",
+                "recently",
+                "lately",
+                "today",
+            )
+            if matched_trigger is None:
+                for rp in relative_phrases:
+                    if rp in lowered:
+                        matched_trigger = rp
+                        is_date_trigger = True
+                        break
+
             # ── Phrase triggers (checked SECOND) ─────────────────────────
             simple_triggers = (
                 "do you remember when",
@@ -1097,6 +1202,12 @@ class MemoryManager:
             for trig in simple_triggers:
                 if trig in remainder:
                     remainder = remainder.replace(trig, " ")
+            # Same treatment for relative phrases — so combined questions like
+            # "what were we talking about this morning" don't leave "morning"
+            # or "today" in the FTS term list.
+            for rp in relative_phrases:
+                if rp in remainder:
+                    remainder = remainder.replace(rp, " ")
             remainder = remainder.rstrip("?.!,").strip()
             cleaned = self._clean_search_query(remainder)
 
