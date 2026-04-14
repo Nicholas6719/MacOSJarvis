@@ -20,9 +20,13 @@ _FIELD = "|||"
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
-def _run_osa(script: str, timeout: int = 30) -> str:
+def _run_osa(script: str, timeout: int = 10) -> str:
     """Run an AppleScript via osascript (stdin), return stdout.
-    Raises RuntimeError on any AppleScript failure."""
+    Raises RuntimeError on any AppleScript failure.
+
+    Default timeout is deliberately short (10s) so a stuck permission
+    dialog or slow Calendar query can't freeze Jarvis's main thread for
+    30+ seconds. Callers that need longer can pass an explicit timeout."""
     try:
         result = subprocess.run(
             ["osascript"],
@@ -32,7 +36,10 @@ def _run_osa(script: str, timeout: int = 30) -> str:
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"AppleScript timed out: {e}") from e
+        raise RuntimeError(
+            f"AppleScript timed out after {timeout}s — "
+            f"Calendar or Reminders may be waiting on a permission dialog"
+        ) from e
     except Exception as e:
         raise RuntimeError(f"AppleScript failed to launch: {e}") from e
 
@@ -90,7 +97,12 @@ _EVENT_FIELDS = ["title", "start", "end", "location", "notes", "calendar"]
 
 def _read_events_script(start_dt: datetime.datetime, end_dt: datetime.datetime) -> str:
     """Build an AppleScript that dumps every event in [start_dt, end_dt)
-    across every calendar, as ~~~-separated records with |||-separated fields."""
+    across every calendar, as ~~~-separated records with |||-separated fields.
+
+    Uses AppleScript's bulk property fetch pattern — `summary of theEvents`
+    returns a list of all titles in a single Apple Event round trip, instead
+    of one round trip per event. This is 10–100x faster on calendars with
+    many events and is essential for keeping Jarvis responsive."""
     return (
         _as_date_block("theStart", start_dt)
         + _as_date_block("theEnd", end_dt)
@@ -102,31 +114,41 @@ def _read_events_script(start_dt: datetime.datetime, end_dt: datetime.datetime) 
         + '    try\n'
         + '      set calName to name of cal as string\n'
         + '      set theEvents to (every event of cal whose start date is greater than or equal to theStart and start date is less than theEnd)\n'
-        + '      repeat with evt in theEvents\n'
-        + '        set evTitle to ""\n'
-        + '        try\n'
-        + '          set evTitle to summary of evt as string\n'
-        + '        end try\n'
-        + '        set evStart to ""\n'
-        + '        try\n'
-        + '          set evStart to (start date of evt) as string\n'
-        + '        end try\n'
-        + '        set evEnd to ""\n'
-        + '        try\n'
-        + '          set evEnd to (end date of evt) as string\n'
-        + '        end try\n'
-        + '        set evLoc to ""\n'
-        + '        try\n'
-        + '          set l to location of evt\n'
-        + '          if l is not missing value then set evLoc to l as string\n'
-        + '        end try\n'
-        + '        set evNotes to ""\n'
-        + '        try\n'
-        + '          set n to description of evt\n'
-        + '          if n is not missing value then set evNotes to n as string\n'
-        + '        end try\n'
-        + '        set outputText to outputText & evTitle & fldSep & evStart & fldSep & evEnd & fldSep & evLoc & fldSep & evNotes & fldSep & calName & recSep\n'
-        + '      end repeat\n'
+        + '      if (count of theEvents) is 0 then\n'
+        + '        -- skip\n'
+        + '      else\n'
+        + '        -- Bulk property fetches (fast: one Apple Event per property).\n'
+        + '        set theTitles to summary of theEvents\n'
+        + '        set theStarts to start date of theEvents\n'
+        + '        set theEnds to end date of theEvents\n'
+        + '        repeat with i from 1 to count of theEvents\n'
+        + '          set evTitle to ""\n'
+        + '          try\n'
+        + '            set evTitle to (item i of theTitles) as string\n'
+        + '          end try\n'
+        + '          set evStart to ""\n'
+        + '          try\n'
+        + '            set evStart to (item i of theStarts) as string\n'
+        + '          end try\n'
+        + '          set evEnd to ""\n'
+        + '          try\n'
+        + '            set evEnd to (item i of theEnds) as string\n'
+        + '          end try\n'
+        + '          -- Location and notes accessed per-event because they\n'
+        + '          -- may be missing value and bulk fetch fails on missings.\n'
+        + '          set evLoc to ""\n'
+        + '          try\n'
+        + '            set l to location of (item i of theEvents)\n'
+        + '            if l is not missing value then set evLoc to l as string\n'
+        + '          end try\n'
+        + '          set evNotes to ""\n'
+        + '          try\n'
+        + '            set n to description of (item i of theEvents)\n'
+        + '            if n is not missing value then set evNotes to n as string\n'
+        + '          end try\n'
+        + '          set outputText to outputText & evTitle & fldSep & evStart & fldSep & evEnd & fldSep & evLoc & fldSep & evNotes & fldSep & calName & recSep\n'
+        + '        end repeat\n'
+        + '      end if\n'
         + '    end try\n'
         + '  end repeat\n'
         + 'end tell\n'
@@ -139,7 +161,7 @@ def get_today_events() -> list:
     today = datetime.date.today()
     start = datetime.datetime.combine(today, datetime.time(0, 0, 0))
     end = start + datetime.timedelta(days=1)
-    raw = _run_osa(_read_events_script(start, end), timeout=45)
+    raw = _run_osa(_read_events_script(start, end), timeout=15)
     return _parse_records(raw, _EVENT_FIELDS)
 
 
@@ -155,7 +177,7 @@ def get_upcoming_events() -> list:
     start = datetime.datetime.combine(today, datetime.time(0, 0, 0))
     # end is exclusive: midnight after Saturday
     end = start + datetime.timedelta(days=days_until_sat + 1)
-    raw = _run_osa(_read_events_script(start, end), timeout=60)
+    raw = _run_osa(_read_events_script(start, end), timeout=20)
     return _parse_records(raw, _EVENT_FIELDS)
 
 
@@ -190,7 +212,7 @@ def get_all_reminders() -> list:
         + 'end tell\n'
         + 'return outputText\n'
     )
-    raw = _run_osa(script, timeout=45)
+    raw = _run_osa(script, timeout=15)
     return _parse_records(raw, _REMINDER_FIELDS)
 
 
@@ -207,7 +229,7 @@ def get_calendar_names() -> list:
         + 'end tell\n'
         + 'return outputText\n'
     )
-    raw = _run_osa(script, timeout=20)
+    raw = _run_osa(script, timeout=10)
     return [n.strip() for n in raw.split(_FIELD) if n.strip()]
 
 

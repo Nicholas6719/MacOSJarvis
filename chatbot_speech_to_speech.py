@@ -1243,32 +1243,38 @@ class VoiceAssistant:
     def _detect_calendar_intent(self, text: str) -> Optional[str]:
         """Classify an utterance as a calendar/reminder intent before it
         reaches the LLM. Returns one of: read_today, read_upcoming,
-        read_reminders, create_event, create_reminder, or None."""
+        read_reminders, create_event, create_reminder, or None.
+
+        IMPORTANT: every pattern here MUST require a strong, unambiguous
+        calendar/reminder keyword. Broad patterns like "I'm working" are
+        forbidden — they false-positive on casual conversation and route
+        a chat message into the (slow) calendar pipeline."""
         t = (text or "").lower().strip()
         if not t:
             return None
 
         # ── Read reminders ───────────────────────────────────────────────
         if re.search(r"\bwhat\s+are\s+my\s+reminders\b", t) or \
-           re.search(r"\bwhat\s+do\s+i\s+need\s+to\s+do\b", t) or \
+           re.search(r"\bwhat\s+do\s+i\s+need\s+to\s+do\s+(?:today|this\s+week)\b", t) or \
            re.search(r"\bshow\s+(?:me\s+)?my\s+reminders\b", t) or \
-           re.search(r"\bread\s+(?:me\s+)?my\s+reminders\b", t):
+           re.search(r"\bread\s+(?:me\s+)?my\s+reminders\b", t) or \
+           re.search(r"\blist\s+(?:all\s+)?my\s+reminders\b", t):
             return "read_reminders"
 
         # ── Read today's calendar ────────────────────────────────────────
         if re.search(r"\bwhat(?:'s|\s+is)\s+on\s+my\s+calendar\s+today\b", t) or \
-           re.search(r"\bwhat\s+do\s+i\s+have\s+(?:on\s+)?today\b", t) or \
+           re.search(r"\b(?:my\s+)?calendar\s+(?:for\s+)?today\b", t) or \
            re.search(r"\b(?:my\s+)?schedule\s+for\s+today\b", t) or \
            re.search(r"\bwhat(?:'s|\s+is)\s+my\s+schedule\s+today\b", t) or \
            re.search(r"\banything\s+on\s+(?:my\s+)?calendar\s+today\b", t):
             return "read_today"
 
         # ── Read upcoming (rest of the week) ─────────────────────────────
-        if re.search(r"\bwhat(?:'s|\s+is)\s+coming\s+up\b", t) or \
-           re.search(r"\bwhat(?:'s|\s+is)\s+on\s+my\s+calendar\s+this\s+week\b", t) or \
-           re.search(r"\bwhat\s+do\s+i\s+have\s+(?:on\s+)?(?:this\s+)?week\b", t) or \
-           re.search(r"\b(?:my\s+)?schedule\s+(?:for\s+)?this\s+week\b", t) or \
-           re.search(r"\bwhat(?:'s|\s+is)\s+on\s+(?:my\s+)?agenda\b", t):
+        # what'?s allows "what's" / "whats" (transcription often drops apostrophes).
+        if re.search(r"\bwhat'?s\s+coming\s+up\s+on\s+(?:my\s+)?(?:calendar|schedule)\b", t) or \
+           re.search(r"\bwhat(?:'?s|\s+is)\s+on\s+my\s+calendar\s+(?:this\s+)?week\b", t) or \
+           re.search(r"\b(?:my\s+)?schedule\s+(?:for\s+)?(?:this\s+)?week\b", t) or \
+           re.search(r"\bwhat(?:'?s|\s+is)\s+on\s+(?:my\s+)?agenda\b", t):
             return "read_upcoming"
 
         # ── Create reminder ──────────────────────────────────────────────
@@ -1276,18 +1282,21 @@ class VoiceAssistant:
         # handled by _handle_system_command and runs first, so we only
         # see requests here that describe a persistent reminder.
         if re.search(r"\bset\s+(?:a\s+)?reminder\s+to\b", t) or \
-           re.search(r"\bdon'?t\s+let\s+me\s+forget\b", t) or \
-           re.search(r"\bremind\s+me\s+to\b", t) or \
            re.search(r"\bcreate\s+(?:a\s+)?reminder\b", t) or \
-           re.search(r"\badd\s+(?:a\s+)?reminder\b", t):
+           re.search(r"\badd\s+(?:a\s+)?reminder\b", t) or \
+           re.search(r"\bremind\s+me\s+to\b", t):
             return "create_reminder"
 
         # ── Create calendar event ────────────────────────────────────────
-        if re.search(r"\b(?:add|schedule|put)\b[^.]*\b(?:on\s+my\s+)?calendar\b", t) or \
+        # STRICT: every trigger MUST include an unambiguous calendar word
+        # (calendar, event, meeting, appointment). Do NOT match phrases
+        # like "I'm working" — that's casual conversation, not a command.
+        if re.search(r"\b(?:add|schedule|put|create|book)\b[^.?!]{0,40}\b(?:to|on|in|for)\s+(?:my\s+)?calendar\b", t) or \
+           re.search(r"\bput\s+(?:this|that|it)\s+on\s+my\s+calendar\b", t) or \
            re.search(r"\bcreate\s+(?:a\s+)?(?:new\s+)?(?:calendar\s+)?event\b", t) or \
-           re.search(r"\b(?:schedule|add|book)\s+(?:a\s+)?(?:meeting|appointment)\b", t) or \
-           re.search(r"\bi'?m\s+working\b", t) or \
-           re.search(r"\bput\s+(?:this\s+|that\s+)?on\s+my\s+calendar\b", t):
+           re.search(r"\badd\s+(?:a\s+)?(?:new\s+)?(?:calendar\s+)?event\b", t) or \
+           re.search(r"\b(?:schedule|add|book|create)\s+[^.?!]{0,30}\b(?:meeting|appointment)\b", t) or \
+           re.search(r"\bnew\s+(?:calendar\s+)?event\b", t):
             return "create_event"
 
         return None
@@ -1720,7 +1729,19 @@ class VoiceAssistant:
     # ── Dispatch + pending resume ───────────────────────────────────────────
 
     def _handle_calendar_intent(self, intent: str, user_input: str) -> None:
-        """Dispatch a detected calendar intent to the matching handler."""
+        """Dispatch a detected calendar intent to the matching handler.
+
+        CRITICAL: this mirrors the state management inside handle_turn:
+        it cancels the conversation timer up front, sets ws_server state
+        to 'thinking' so the UI shows activity during the LLM and
+        AppleScript calls, and in a finally block restores idle state +
+        restarts the conversation timer. Without this the UI freezes on
+        the previous state for the whole duration of the calendar call,
+        and a mid-flight exception can leave Jarvis stuck with a pending
+        calendar action that swallows every subsequent utterance."""
+        self._cancel_conversation_timer()
+        self._stop_speak.clear()
+        ws_server.set_state("thinking")
         try:
             if intent == "read_today":
                 self._handle_read_today()
@@ -1734,9 +1755,20 @@ class VoiceAssistant:
                 self._handle_create_reminder(user_input)
         except Exception as e:
             print(f"[Calendar] dispatch error ({intent}): {e}")
-            self.speak_direct(
-                "I ran into a problem handling that calendar request, Sir."
-            )
+            # Defensive: clear any half-set pending action so we don't
+            # leave the assistant waiting for an answer that will never come.
+            global pending_calendar_action
+            pending_calendar_action = None
+            try:
+                self.speak_direct(
+                    "I ran into a problem handling that calendar request, Sir."
+                )
+            except Exception:
+                pass
+        finally:
+            ws_server.set_state("idle")
+            if self._in_conversation:
+                self._start_conversation_timer()
 
     def _resume_pending_calendar_action(self, answer: str) -> None:
         """The user just answered a clarifying question. Apply their answer
@@ -2367,14 +2399,22 @@ class VoiceAssistant:
                 # Clipboard augmentation
                 augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
 
-                # System command or LLM
+                # System command, calendar intent, or LLM
                 sys_response = self._handle_system_command(user_input)
+                cal_intent = None
+                if not sys_response:
+                    # Only probe calendar intent if no system command matched.
+                    # Every pattern in _detect_calendar_intent requires a
+                    # strong calendar/reminder keyword, so casual chat falls
+                    # straight through to None and the LLM path.
+                    cal_intent = self._detect_calendar_intent(user_input)
+
                 if sys_response and sys_response != WAKE_MODE_SENTINEL:
                     print(f"System: {sys_response}")
                     self.speak_direct(sys_response)
                 elif sys_response == WAKE_MODE_SENTINEL:
                     pass  # Already spoken and handled inside the command
-                elif (cal_intent := self._detect_calendar_intent(user_input)) is not None:
+                elif cal_intent is not None:
                     print(f"[Calendar] Intent: {cal_intent}")
                     self._handle_calendar_intent(cal_intent, user_input)
                 else:
