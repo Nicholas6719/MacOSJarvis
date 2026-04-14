@@ -1263,6 +1263,11 @@ class VoiceAssistant:
                     self.speak_direct("One moment, Sir. Updating my memory.")
                 except Exception as e:
                     print(f"[Memory] memory-update speak error: {e}")
+                finally:
+                    # speak_direct leaves state on "idle" — restore to "wake"
+                    # since we're summarizing from the wake-mode hook.
+                    if not self._in_conversation:
+                        ws_server.set_state("wake")
 
             for batch in batches:
                 try:
@@ -1327,6 +1332,13 @@ class VoiceAssistant:
             print(f"[Memory] Summarization error: {e}")
         finally:
             self._summarizing = False
+            # Safety net: if we ran from the wake-mode hook, make sure the UI
+            # state is restored to "wake" when we finish.
+            if not self._in_conversation:
+                try:
+                    ws_server.set_state("wake")
+                except Exception:
+                    pass
 
     def _rebuild_system_prompt(self) -> None:
         """Rebuild the system prompt from the base prompt + current memory facts
