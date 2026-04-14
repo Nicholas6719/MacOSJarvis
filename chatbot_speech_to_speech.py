@@ -1456,11 +1456,20 @@ class VoiceAssistant:
         recent    = self.history[-(max_pairs * 2):]
         return [{"role": "system", "content": self.system_prompt}] + recent
 
-    def stream_sentences(self, user_text: str):
+    def stream_sentences(self, user_text: str, memory_context: Optional[str] = None):
+        # Always append the CLEAN user_text to history — never the injected
+        # memory context. That's persisted only for this one LLM call.
         self.history.append({"role": "user", "content": user_text})
 
+        messages = self._messages()
+        if memory_context:
+            # Replace the last user message (the one we just appended) with
+            # a prefixed version for this one call only. history stays clean.
+            prefixed = memory_context + user_text
+            messages = messages[:-1] + [{"role": "user", "content": prefixed}]
+
         stream = self._llm.create_chat_completion(
-            messages=self._messages(),
+            messages=messages,
             max_tokens=self._llm_cfg.get("max_new_tokens", 256),
             temperature=self._llm_cfg.get("temperature", 0.7),
             top_p=self._llm_cfg.get("top_p", 0.9),
@@ -1501,8 +1510,12 @@ class VoiceAssistant:
 
         self.history.append({"role": "assistant", "content": _clean(full)})
 
-    def handle_turn(self, user_input: str) -> None:
-        """Three-thread pipeline: LLM → TTS → SeamlessPlayer (zero-gap audio)."""
+    def handle_turn(self, user_input: str, memory_context: Optional[str] = None) -> None:
+        """Three-thread pipeline: LLM → TTS → SeamlessPlayer (zero-gap audio).
+
+        memory_context (optional) is a one-turn prefix injected into the LLM
+        call for retrieved memory search results. It is NOT saved to history
+        or to the database — only the clean user_input is persisted."""
         self._cancel_conversation_timer()  # Pause while processing + speaking
         self._stop_speak.clear()
         ws_server.set_state("thinking")
@@ -1516,7 +1529,7 @@ class VoiceAssistant:
         display_lock = threading.Lock()
 
         def _llm() -> None:
-            for chunk in self.stream_sentences(user_input):
+            for chunk in self.stream_sentences(user_input, memory_context=memory_context):
                 sentence_q.put(chunk)
             sentence_q.put(None)
 
@@ -1560,6 +1573,7 @@ class VoiceAssistant:
         sys.stdout.flush()
 
         memory.save_exchange(user_input, response_text)
+        memory.rebuild_fts_indexes()
 
         player.wait()
         llm_t.join()
@@ -1691,6 +1705,24 @@ class VoiceAssistant:
                     self._rebuild_system_prompt()
                     # Let the LLM respond naturally below
 
+                # Level 4: Memory search — detect questions about past
+                # context and retrieve matching rows via FTS5. Runs after
+                # remember/forget so those always take priority, and before
+                # auto-detect so it can't trigger a fact save.
+                search_query = memory.detect_memory_search_query(user_input)
+                memory_search_results: list = []
+                if search_query:
+                    memory_search_results = memory.search_memory(search_query)
+                    if memory_search_results:
+                        print(
+                            f"[Memory] Search query: '{search_query}' — "
+                            f"{len(memory_search_results)} result(s) found."
+                        )
+                    else:
+                        print(
+                            f"[Memory] Search query: '{search_query}' — no results."
+                        )
+
                 # Auto-detect a casually mentioned personal fact (Level 2)
                 if not remember_fact and not forget_term:
                     detected = memory.auto_detect_fact(user_input)
@@ -1752,7 +1784,27 @@ class VoiceAssistant:
                 elif sys_response == WAKE_MODE_SENTINEL:
                     pass  # Already spoken and handled inside the command
                 else:
-                    self.handle_turn(augmented_input)
+                    # Build the one-turn memory context block if we have search hits.
+                    memory_context: Optional[str] = None
+                    if memory_search_results:
+                        def _row_desc(r: dict) -> str:
+                            if r.get("source") == "summary":
+                                body = r.get("summary_text", "")
+                                ts = (r.get("date_from", "") or "")[:10]
+                            else:
+                                body = r.get("content", "")
+                                ts = (r.get("timestamp", "") or "")[:10]
+                            return f"- {body} ({ts})"
+
+                        memory_context = (
+                            "[Retrieved memory context for this question:\n"
+                            + "\n".join(_row_desc(r) for r in memory_search_results)
+                            + "\nUse this context to answer the following question "
+                            "naturally, as if recalling from memory. Do not say you "
+                            "searched a database. Do not say 'according to my records'.]"
+                            "\n\n"
+                        )
+                    self.handle_turn(augmented_input, memory_context=memory_context)
 
                 # Copy LLM response to clipboard if requested
                 if is_clipboard and self.history:

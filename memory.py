@@ -25,6 +25,17 @@ _REMEMBER_TRIGGERS = (
     "keep in mind that",
 )
 
+_SEARCH_STOP_WORDS = frozenset({
+    "i", "me", "my", "the", "a", "an", "is", "was", "were", "did", "do",
+    "you", "about", "when", "what", "that", "it", "in", "on", "at", "to",
+    "of", "and", "or", "for", "with", "this", "we",
+})
+
+_MONTHS = (
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+)
+
 _FORGET_TRIGGERS = (
     "forget that",
     "don't remember",
@@ -113,7 +124,22 @@ class MemoryManager:
                 )
                 """
             )
+            # Level 4: FTS5 search indexes — virtual tables, not data stores.
+            self._conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts
+                USING fts5(content, role, content='conversations', content_rowid='id')
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS summaries_fts
+                USING fts5(summary_text, content='summaries', content_rowid='id')
+                """
+            )
             self._conn.commit()
+            # Always keep indexes current on startup.
+            self.rebuild_fts_indexes()
         except Exception as e:
             print(f"[Memory] Init error: {e}")
 
@@ -693,3 +719,200 @@ class MemoryManager:
         except Exception as e:
             print(f"[Memory] format_meta_summary_for_prompt error: {e}")
             return ""
+
+    # ── Level 4: Searchable memory (FTS5) ───────────────────────────────────
+    def rebuild_fts_indexes(self) -> None:
+        """Sync the FTS5 virtual tables with their source tables. Safe to
+        call repeatedly — FTS5's 'rebuild' command is idempotent."""
+        try:
+            self._conn.execute(
+                "INSERT INTO conversations_fts(conversations_fts) VALUES('rebuild')"
+            )
+            self._conn.execute(
+                "INSERT INTO summaries_fts(summaries_fts) VALUES('rebuild')"
+            )
+            self._conn.commit()
+        except Exception as e:
+            print(f"[Memory] rebuild_fts_indexes error: {e}")
+
+    def _clean_search_query(self, query: str) -> str:
+        """Strip punctuation, lowercase, drop stop words. Returns the cleaned
+        term with words joined by spaces, ready for an FTS5 MATCH clause."""
+        if not query:
+            return ""
+        # Keep only alphanumerics and spaces; this also escapes FTS5 operators.
+        cleaned = re.sub(r"[^a-z0-9\s]", " ", query.lower())
+        words = [w for w in cleaned.split() if w and w not in _SEARCH_STOP_WORDS]
+        return " ".join(words)
+
+    def search_memory(self, query: str, max_results: int = 5) -> list:
+        """Full-text search across conversations and summaries. Returns a
+        combined, ranked list of result dicts (max `max_results` total).
+        Returns [] on any error or if the cleaned query is too short."""
+        try:
+            cleaned = self._clean_search_query(query)
+            if not cleaned or len(cleaned) < 3:
+                return []
+
+            # FTS5 MATCH accepts space-separated terms (implicit AND/OR per
+            # FTS5 grammar). Use them as-is since _clean_search_query already
+            # stripped all special characters.
+            results = []
+
+            try:
+                cur = self._conn.execute(
+                    "SELECT c.id, c.role, c.content, c.timestamp "
+                    "FROM conversations_fts f "
+                    "JOIN conversations c ON c.id = f.rowid "
+                    "WHERE conversations_fts MATCH ? "
+                    "ORDER BY rank LIMIT ?",
+                    (cleaned, max_results),
+                )
+                for cid, role, content, ts in cur.fetchall():
+                    results.append(
+                        {
+                            "source": "conversation",
+                            "id": cid,
+                            "role": role,
+                            "content": content or "",
+                            "timestamp": ts or "",
+                        }
+                    )
+            except Exception as e:
+                print(f"[Memory] conversations_fts MATCH error: {e}")
+
+            try:
+                cur = self._conn.execute(
+                    "SELECT s.id, s.summary_text, s.date_from, s.date_to "
+                    "FROM summaries_fts f "
+                    "JOIN summaries s ON s.id = f.rowid "
+                    "WHERE summaries_fts MATCH ? "
+                    "ORDER BY rank LIMIT ?",
+                    (cleaned, max_results),
+                )
+                for sid, text, dfrom, dto in cur.fetchall():
+                    results.append(
+                        {
+                            "source": "summary",
+                            "id": sid,
+                            "summary_text": text or "",
+                            "date_from": dfrom or "",
+                            "date_to": dto or "",
+                        }
+                    )
+            except Exception as e:
+                print(f"[Memory] summaries_fts MATCH error: {e}")
+
+            # Cap total at max_results, preferring summaries first (they're
+            # higher signal per row), then falling back to conversation hits.
+            summaries_first = [r for r in results if r["source"] == "summary"]
+            convs = [r for r in results if r["source"] == "conversation"]
+            combined = (summaries_first + convs)[:max_results]
+            return combined
+        except Exception as e:
+            print(f"[Memory] search_memory error: {e}")
+            return []
+
+    def detect_memory_search_query(self, text: str):
+        """Return a cleaned search term if the user's question is clearly
+        about retrieving past memory. Return None otherwise. Never overlaps
+        with remember/forget/readback command handlers."""
+        try:
+            if not text:
+                return None
+            t = text.strip()
+            # Must be substantial — at least 4 words total.
+            if len(t.split()) < 4:
+                return None
+
+            lowered = t.lower()
+
+            # Explicit exclusions — these belong to other handlers.
+            if "what do you know about me" in lowered:
+                return None
+            if "what have you remembered" in lowered:
+                return None
+            if "what do you remember about me" in lowered:
+                return None
+            if "tell me what you know about me" in lowered:
+                return None
+            if "what facts do you have about me" in lowered:
+                return None
+            # Remember command patterns (save, not search).
+            for rt in _REMEMBER_TRIGGERS:
+                if rt in lowered:
+                    return None
+            # Forget command patterns (delete, not search).
+            for ft in _FORGET_TRIGGERS:
+                if ft in lowered:
+                    return None
+
+            # Direct phrase triggers — simple substring tests first.
+            simple_triggers = (
+                "do you remember when",
+                "do you remember what",
+                "what were we talking about",
+                "what was i working on",
+                "what did i say about",
+                "what did we talk about",
+                "what have i told you about",
+                "remember when i",
+                "do you recall",
+            )
+            matched_trigger = None
+            for trig in simple_triggers:
+                if trig in lowered:
+                    matched_trigger = trig
+                    break
+
+            if matched_trigger is None:
+                # "back in <month>" — always a trigger.
+                m = re.search(
+                    rf"\bback in ({'|'.join(_MONTHS)})\b", lowered
+                )
+                if m:
+                    matched_trigger = m.group(0)
+
+            if matched_trigger is None:
+                # "in <month>" ONLY when followed by a 4-digit year or
+                # "when i" / "that i".
+                m = re.search(
+                    rf"\bin ({'|'.join(_MONTHS)})(?:\s+(\d{{4}}|when i|that i))",
+                    lowered,
+                )
+                if m:
+                    matched_trigger = m.group(0)
+
+            if matched_trigger is None:
+                # "on <month> <day>" e.g. "on April 14th".
+                m = re.search(
+                    rf"\bon ({'|'.join(_MONTHS)})\s+\d+",
+                    lowered,
+                )
+                if m:
+                    matched_trigger = m.group(0)
+
+            if matched_trigger is None:
+                # "what do i usually X" — require at least one topic word
+                # after "usually".
+                m = re.search(r"\bwhat do i usually (\w+(?:\s+\w+)+)", lowered)
+                if m:
+                    matched_trigger = "what do i usually"
+
+            if matched_trigger is None:
+                return None
+
+            # Strip the trigger from the text and clean what remains.
+            idx = lowered.find(matched_trigger)
+            remainder = (
+                lowered[:idx] + lowered[idx + len(matched_trigger):]
+            ).strip()
+            remainder = remainder.rstrip("?.!,").strip()
+
+            cleaned = self._clean_search_query(remainder)
+            if not cleaned or len(cleaned) < 3:
+                return None
+            return cleaned
+        except Exception as e:
+            print(f"[Memory] detect_memory_search_query error: {e}")
+            return None
