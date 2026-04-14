@@ -211,6 +211,7 @@ class VoiceAssistant:
         self._pending_memory_ack = False
         self._needs_wake_summarization = True  # Fires on first wake-mode iteration
         self._summarizing = False              # Prevent concurrent summarization runs
+        self._first_summarization = True       # Only speak the memory-update line at startup
         self._stop_speak = threading.Event()
         self._tts_speaking = False
         self._cancel_timer = threading.Event()
@@ -1258,7 +1259,9 @@ class VoiceAssistant:
                 f"exchange rows in {len(batches)} batch(es)…"
             )
 
-            if SPEAK_MEMORY_UPDATE:
+            # Only speak the memory-update line on the initial startup run.
+            # Re-entries from inactivity timeout or manual return-to-wake stay silent.
+            if SPEAK_MEMORY_UPDATE and self._first_summarization:
                 try:
                     self.speak_direct("One moment, Sir. Updating my memory.")
                 except Exception as e:
@@ -1268,6 +1271,7 @@ class VoiceAssistant:
                     # since we're summarizing from the wake-mode hook.
                     if not self._in_conversation:
                         ws_server.set_state("wake")
+            self._first_summarization = False
 
             for batch in batches:
                 try:
