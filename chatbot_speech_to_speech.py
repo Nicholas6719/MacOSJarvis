@@ -14,6 +14,7 @@ import datetime
 import json
 import os
 import queue
+import random
 import re
 import subprocess
 import sys
@@ -191,7 +192,7 @@ class VoiceAssistant:
         if prior_exchanges:
             self.history.extend(prior_exchanges)
             print(f"[Memory] Loaded {len(prior_exchanges)} messages from previous session.")
-        self.system_prompt: str = self.cfg["llm"].get(
+        self._base_prompt: str = self.cfg["llm"].get(
             "prompt_behavior",
             "You are Jarvis, a helpful and concise voice assistant. "
             "Your name is Jarvis. The user's name is Nicholas. "
@@ -199,10 +200,9 @@ class VoiceAssistant:
             "If asked for your name, say your name is Jarvis. "
             "Keep answers brief and conversational. No bullet points or markdown.",
         )
-        facts_str = memory.format_facts_for_prompt()
-        if facts_str:
-            self.system_prompt = self.system_prompt + "\n\n" + facts_str
-        self.system_prompt = self.system_prompt + " When the user asks you to remember something, confirm it naturally with a brief phrase like 'Got it, I will keep that in mind' or 'Noted.' Do not repeat the fact back verbatim."
+        self.system_prompt: str = ""
+        self._rebuild_system_prompt()
+        self._pending_memory_ack = False
         self._stop_speak = threading.Event()
         self._tts_speaking = False
         self._cancel_timer = threading.Event()
@@ -1213,6 +1213,33 @@ class VoiceAssistant:
 
     # ── Turn (LLM pipeline) ───────────────────────────────────────────────────
 
+    def _speak_memory_ack(self) -> None:
+        """Speak a subtle in-character acknowledgment after auto-saving a fact."""
+        ack = random.choice([
+            "Noted.",
+            "Understood.",
+            "Duly noted.",
+            "I'll keep that in mind.",
+            "Noted, Sir.",
+            "Understood, Sir.",
+            "Duly noted, Sir.",
+        ])
+        print(f"[Memory] {ack}")
+        try:
+            self.speak_direct(ack)
+        except Exception as e:
+            print(f"[Memory] ack speak error: {e}")
+
+    def _rebuild_system_prompt(self) -> None:
+        """Rebuild the system prompt from the base prompt + current memory facts.
+        Called at startup and whenever facts change mid-session."""
+        prompt = self._base_prompt
+        facts_str = memory.format_facts_for_prompt()
+        if facts_str:
+            prompt = prompt + "\n\n" + facts_str
+        prompt = prompt + " When the user asks you to remember something, confirm it naturally with a brief phrase like 'Got it, I will keep that in mind' or 'Noted.' Do not repeat the fact back verbatim."
+        self.system_prompt = prompt
+
     def _messages(self) -> list[dict]:
         max_pairs = self._llm_cfg.get("history_turns", 10)
         recent    = self.history[-(max_pairs * 2):]
@@ -1432,6 +1459,66 @@ class VoiceAssistant:
                     fact_key = "user_note_" + str(int(time.time()))
                     memory.save_fact(fact_key, remember_fact)
                     print(f"[Memory] Saved fact: {remember_fact}")
+                    self._rebuild_system_prompt()
+
+                # Forget command (Level 2) — checked before auto-detect so
+                # "forget that I like coffee" doesn't re-save the fact.
+                forget_term = memory.detect_forget_command(user_input)
+                if forget_term:
+                    deleted = memory.delete_matching_facts(forget_term)
+                    print(f"[Memory] Deleted {deleted} fact(s) matching: {forget_term}")
+                    self._rebuild_system_prompt()
+                    # Let the LLM respond naturally below
+
+                # Auto-detect a casually mentioned personal fact (Level 2)
+                if not remember_fact and not forget_term:
+                    detected = memory.auto_detect_fact(user_input)
+                    if detected:
+                        fact_key, fact_value = detected
+                        existing_values = [v for k, v in memory.get_all_facts()]
+                        if not memory.facts_are_similar(fact_value, existing_values):
+                            memory.save_fact(fact_key, fact_value)
+                            print(f"[Memory] Auto-saved fact: {fact_value}")
+                            self._rebuild_system_prompt()
+                            self._pending_memory_ack = True
+                        else:
+                            print(f"[Memory] Skipped duplicate: {fact_value}")
+
+                # "What do you know about me?" readback (Level 2)
+                readback_triggers = (
+                    "what do you know about me",
+                    "what have you remembered",
+                    "what do you remember about me",
+                    "tell me what you know about me",
+                    "what facts do you have about me",
+                )
+                lowered_input = user_input.lower()
+                is_readback = any(t in lowered_input for t in readback_triggers)
+
+                if is_readback:
+                    facts = memory.get_facts_for_readback()
+                    if facts:
+                        fact_list = "\n".join(f"- {f}" for f in facts)
+                        readback_prompt = (
+                            "The user has asked what you know about them. Here are the stored facts:\n"
+                            f"{fact_list}\n"
+                            "Respond in one natural, conversational paragraph. Do NOT use bullet points. "
+                            "Weave them together as if recalling what you know about this person — warm, "
+                            "organic, and intelligent. Do not start with 'Of course' or 'Certainly'. "
+                            "Do not say you are reading from a list."
+                        )
+                        self.handle_turn(readback_prompt)
+                    else:
+                        self.handle_turn(
+                            "The user asked what you know about them, but you don't have much stored yet. "
+                            "Respond naturally and briefly, acknowledging you don't have much memory of them yet "
+                            "and inviting them to tell you more."
+                        )
+                    if self._pending_memory_ack:
+                        self._pending_memory_ack = False
+                        self._speak_memory_ack()
+                    print()
+                    continue
 
                 # Clipboard augmentation
                 augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
@@ -1452,6 +1539,11 @@ class VoiceAssistant:
                     if last:
                         self._copy_to_clipboard(last)
                         print("📋  Response copied to clipboard.", flush=True)
+
+                # Subtle in-character ack for auto-detected facts (Level 2)
+                if self._pending_memory_ack:
+                    self._pending_memory_ack = False
+                    self._speak_memory_ack()
 
                 print()
 
