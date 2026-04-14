@@ -1053,18 +1053,18 @@ class MemoryManager:
                     is_date_trigger = True
 
             # ── Phrase triggers (checked SECOND) ─────────────────────────
+            simple_triggers = (
+                "do you remember when",
+                "do you remember what",
+                "what were we talking about",
+                "what was i working on",
+                "what did i say about",
+                "what did we talk about",
+                "what have i told you about",
+                "remember when i",
+                "do you recall",
+            )
             if matched_trigger is None:
-                simple_triggers = (
-                    "do you remember when",
-                    "do you remember what",
-                    "what were we talking about",
-                    "what was i working on",
-                    "what did i say about",
-                    "what did we talk about",
-                    "what have i told you about",
-                    "remember when i",
-                    "do you recall",
-                )
                 for trig in simple_triggers:
                     if trig in lowered:
                         matched_trigger = trig
@@ -1090,6 +1090,13 @@ class MemoryManager:
             remainder = (
                 lowered[:idx] + lowered[idx + len(matched_trigger):]
             ).strip()
+            # Also strip any OTHER simple phrase triggers that slipped into
+            # the remainder. Prevents filler verbs like "talking" / "working"
+            # from leaking through when a date trigger was primary (e.g.
+            # "in April 2026 what were we talking about").
+            for trig in simple_triggers:
+                if trig in remainder:
+                    remainder = remainder.replace(trig, " ")
             remainder = remainder.rstrip("?.!,").strip()
             cleaned = self._clean_search_query(remainder)
 
