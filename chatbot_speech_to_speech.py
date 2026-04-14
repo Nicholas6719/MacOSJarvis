@@ -32,10 +32,19 @@ import webrtcvad
 from openwakeword.model import Model as WakeWordModel
 
 import ws_server
+import calendar_reminders
 
 from memory import MemoryManager
 memory = MemoryManager()
 memory.seed_initial_facts()
+
+
+# ── Calendar: feature flags ─────────────────────────────────────────────────
+# Set False to suppress the brief "One moment, Sir" ack that Jarvis speaks
+# before running a calendar command. The ack gives the user instant feedback
+# while the background worker fetches data from Calendar.app / Reminders.app.
+# Flip this to False if the ack feels tedious — no other change needed.
+SPEAK_CALENDAR_ACK = True
 
 
 class JarvisPauseRequest(Exception):
@@ -216,6 +225,19 @@ class VoiceAssistant:
         self._tts_speaking = False
         self._cancel_timer = threading.Event()
         self.pending_confirmation: Optional[dict] = None
+
+        # ── Calendar worker state ────────────────────────────────────────
+        # _calendar_working is an Event set while a background calendar
+        # worker thread is running. While it's set, the main loop skips
+        # audio recording — no concurrent TTS, no swallowed commands, no
+        # state contention. The worker clears it from its finally block.
+        self._calendar_working = threading.Event()
+        # _pending_calendar_action holds a pending clarifying question
+        # (e.g. "Where are you working, Sir?"). The next user utterance
+        # is interpreted as the answer, not a new command. Instance-level
+        # (not module-level) so it dies with the VoiceAssistant and
+        # cannot leak across restarts.
+        self._pending_calendar_action: Optional[dict] = None
 
         # Wake word state
         self._in_conversation = False
@@ -1207,6 +1229,655 @@ class VoiceAssistant:
 
         return None
 
+    # ── Calendar & Reminders ──────────────────────────────────────────────────
+    #
+    # Design rules — every bullet here is load-bearing; violating any of them
+    # was the root cause of the first attempt's hang.
+    #
+    # 1. Intent detection is STRICT REGEX ONLY. Every pattern requires an
+    #    unambiguous calendar keyword (calendar, event, meeting, appointment,
+    #    reminder). NO broad phrases like "I'm working" — those match casual
+    #    chat and falsely route conversation into the calendar pipeline.
+    #
+    # 2. ALL AppleScript runs on a background worker thread. Main loop NEVER
+    #    calls calendar_reminders.* directly. If macOS pops a permission
+    #    dialog, it blocks the worker thread, not the wake-word / voice loop.
+    #
+    # 3. Main loop guards on self._calendar_working.is_set() and skips audio
+    #    recording while a worker is active — no concurrent TTS, no accidental
+    #    capture of the assistant's own "one moment, Sir" output.
+    #
+    # 4. Worker's outermost try/finally GUARANTEES _calendar_working.clear()
+    #    and ws_server state restoration no matter what goes wrong.
+    #
+    # 5. _pending_calendar_action lives on self, not at module level. It's
+    #    only set immediately before speaking a clarifying question, and
+    #    cleared the moment the worker hits any error path.
+    #
+    # 6. All calendar_reminders.* calls have short (10-20s) subprocess
+    #    timeouts. A stuck permission dialog fails fast with a speakable
+    #    error instead of freezing the worker for 30+ seconds.
+
+    # Location-required event types → (memory key, clarifying question).
+    # Location is only requested when the utterance contains one of these
+    # keywords AND there's no matching fact in memory. For everything else,
+    # we just create the event without a location.
+    _LOCATION_MEMORY_MAP = (
+        (("working", "shift", "my shift", "work today"),
+         "work_location", "Where are you working, Sir?"),
+        (("gym", "workout", "lift", "lifting"),
+         "gym_location", "Which gym, Sir?"),
+        (("dentist",),
+         "dentist_location", "Which dentist, Sir?"),
+        (("doctor", "doctor's", "physician"),
+         "doctor_location", "Which doctor's office, Sir?"),
+    )
+
+    _JARVIS_CAL_SYSTEM = (
+        "You are Jarvis, a sharp, composed AI assistant. Speak naturally and "
+        "conversationally — never scripted, never robotic, never a bullet list. "
+        "Address the user as Sir or Nicholas when it fits. Keep replies brief."
+    )
+
+    def _detect_calendar_intent(self, text: str) -> Optional[str]:
+        """STRICT regex-only intent classification for calendar/reminder
+        commands. Returns one of: read_today, read_upcoming, read_reminders,
+        create_event, create_reminder, or None.
+
+        Every pattern MUST include an unambiguous calendar word. Anything
+        without a strong signal falls through to None and normal chat."""
+        t = (text or "").lower().strip()
+        if not t:
+            return None
+
+        # Read reminders
+        if re.search(r"\bwhat\s+are\s+my\s+reminders\b", t) or \
+           re.search(r"\bwhat\s+do\s+i\s+need\s+to\s+do\s+(?:today|this\s+week)\b", t) or \
+           re.search(r"\bshow\s+(?:me\s+)?my\s+reminders\b", t) or \
+           re.search(r"\bread\s+(?:me\s+)?my\s+reminders\b", t) or \
+           re.search(r"\blist\s+(?:all\s+)?my\s+reminders\b", t):
+            return "read_reminders"
+
+        # Read today's calendar
+        if re.search(r"\bwhat(?:'?s|\s+is)\s+on\s+my\s+calendar\s+today\b", t) or \
+           re.search(r"\b(?:my\s+)?calendar\s+(?:for\s+)?today\b", t) or \
+           re.search(r"\b(?:my\s+)?schedule\s+for\s+today\b", t) or \
+           re.search(r"\bwhat(?:'?s|\s+is)\s+my\s+schedule\s+today\b", t) or \
+           re.search(r"\banything\s+on\s+(?:my\s+)?calendar\s+today\b", t):
+            return "read_today"
+
+        # Read upcoming (rest of the week)
+        if re.search(r"\bwhat(?:'?s|\s+is)\s+coming\s+up\s+on\s+(?:my\s+)?(?:calendar|schedule)\b", t) or \
+           re.search(r"\bwhat(?:'?s|\s+is)\s+on\s+my\s+calendar\s+(?:this\s+)?week\b", t) or \
+           re.search(r"\b(?:my\s+)?schedule\s+(?:for\s+)?(?:this\s+)?week\b", t) or \
+           re.search(r"\bwhat(?:'?s|\s+is)\s+on\s+(?:my\s+)?agenda\b", t):
+            return "read_upcoming"
+
+        # Create reminder.
+        # MUST NOT match "remind me in <duration>" — that's a timer, handled
+        # earlier by _handle_system_command. The "to" suffix is the key
+        # discriminator: "remind me TO buy milk" is a reminder; "remind me
+        # IN five minutes" is a timer.
+        if re.search(r"\bset\s+(?:a\s+)?reminder\s+to\b", t) or \
+           re.search(r"\bcreate\s+(?:a\s+)?reminder\b", t) or \
+           re.search(r"\badd\s+(?:a\s+)?reminder\b", t) or \
+           re.search(r"\bremind\s+me\s+to\b", t):
+            return "create_reminder"
+
+        # Create calendar event. STRICT: must include calendar/event/meeting/
+        # appointment as a clear command target. No soft triggers.
+        if re.search(r"\b(?:add|schedule|put|create|book)\b[^.?!]{0,40}\b(?:to|on|in|for)\s+(?:my\s+)?calendar\b", t) or \
+           re.search(r"\bput\s+(?:this|that|it)\s+on\s+my\s+calendar\b", t) or \
+           re.search(r"\bcreate\s+(?:a\s+)?(?:new\s+)?(?:calendar\s+)?event\b", t) or \
+           re.search(r"\badd\s+(?:a\s+)?(?:new\s+)?(?:calendar\s+)?event\b", t) or \
+           re.search(r"\b(?:schedule|add|book|create)\s+[^.?!]{0,30}\b(?:meeting|appointment)\b", t) or \
+           re.search(r"\bnew\s+(?:calendar\s+)?event\b", t):
+            return "create_event"
+
+        return None
+
+    # ── LLM helpers (both silent, non-streaming — no history mutation) ──────
+
+    def _llm_silent(self, system: str, user_prompt: str,
+                    max_tokens: int = 200, temperature: float = 0.6) -> str:
+        """One-shot LLM call with no history side effects. Used for calendar
+        summaries, confirmations, and JSON extraction so system-crafted
+        prompts never pollute the conversation history."""
+        try:
+            result = self._llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=0.9,
+                stop=["<|eot_id|>"],
+                stream=False,
+            )
+            text = (result["choices"][0]["message"]["content"] or "").strip()
+            return _clean(text)
+        except Exception as e:
+            print(f"[Calendar] LLM call error: {e}")
+            return ""
+
+    # ── Structured extraction ──────────────────────────────────────────────
+
+    def _extract_event_json(self, utterance: str) -> Optional[dict]:
+        """Use the LLM to pull structured event fields from a free-form
+        utterance. Returns a dict or None if extraction fails."""
+        today = datetime.date.today().isoformat()
+        prompt = (
+            "Extract calendar event details from this request. Respond in "
+            "JSON only — no explanation, no markdown. Fields: title (string), "
+            "date (YYYY-MM-DD or relative like today/tomorrow/next Monday), "
+            "start_time (HH:MM 24hr), end_time (HH:MM 24hr or null), location "
+            "(string or null), notes (string or null), is_reminder (true/false)."
+            f" Today is {today}. User said: '{utterance}'"
+        )
+        raw = self._llm_silent(
+            "You are a precise JSON extraction tool. Reply with valid JSON only.",
+            prompt,
+            max_tokens=220,
+            temperature=0.1,
+        )
+        if not raw:
+            return None
+        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+        raw = re.sub(r"\s*```\s*$", "", raw).strip()
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if m:
+            raw = m.group(0)
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            print(f"[Calendar] JSON parse error: {e}  — raw: {raw!r}")
+            return None
+
+    def _resolve_relative_date(self, date_str: Optional[str]) -> datetime.date:
+        """Resolve today/tomorrow/ISO/<weekday> to an actual date."""
+        today = datetime.date.today()
+        if not date_str:
+            return today
+        s = str(date_str).lower().strip()
+        if s in ("today", "now"):
+            return today
+        if s == "tomorrow":
+            return today + datetime.timedelta(days=1)
+        if s == "yesterday":
+            return today - datetime.timedelta(days=1)
+        try:
+            return datetime.date.fromisoformat(s)
+        except Exception:
+            pass
+        weekdays = {
+            "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+            "friday": 4, "saturday": 5, "sunday": 6,
+        }
+        m = re.search(r"(next\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)", s)
+        if m:
+            target = weekdays[m.group(2)]
+            delta = (target - today.weekday()) % 7
+            if delta == 0:
+                delta = 7 if m.group(1) else 0
+            return today + datetime.timedelta(days=delta)
+        return today
+
+    def _parse_time(self, t: Optional[str]) -> Optional[tuple]:
+        """Parse HH:MM (24h) into (hour, minute)."""
+        if not t:
+            return None
+        s = str(t).strip()
+        m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+        if not m:
+            return None
+        try:
+            h, mi = int(m.group(1)), int(m.group(2))
+            if 0 <= h <= 23 and 0 <= mi <= 59:
+                return (h, mi)
+        except Exception:
+            pass
+        return None
+
+    # ── Memory-backed location lookup ──────────────────────────────────────
+
+    def _get_fact(self, key: str) -> Optional[str]:
+        """Look up a single fact by key from the memory store."""
+        try:
+            for k, v in memory.get_all_facts():
+                if k == key:
+                    return v
+        except Exception as e:
+            print(f"[Calendar] _get_fact error: {e}")
+        return None
+
+    def _infer_location_memory_key(self, utterance: str) -> Optional[tuple]:
+        """If the utterance describes an event type that typically has a
+        physical location (working, gym, dentist, doctor), return a
+        (memory_key, clarifying_question) tuple. Otherwise return None
+        meaning 'don't ask — just create the event without a location'."""
+        t = (utterance or "").lower()
+        for kws, key, question in self._LOCATION_MEMORY_MAP:
+            if any(k in t for k in kws):
+                return (key, question)
+        return None
+
+    # ── Background worker entry point ──────────────────────────────────────
+
+    def _handle_calendar_command(self, intent: str, user_input: str) -> None:
+        """Kick off a background worker thread and return IMMEDIATELY.
+
+        The main loop must never block waiting for this to finish. The
+        worker sets self._calendar_working at entry and clears it at exit;
+        the main loop guards on that flag and skips audio recording while
+        the worker is active."""
+        self._cancel_conversation_timer()
+        self._calendar_working.set()
+        ws_server.set_state("thinking")
+
+        # Speak a brief ack synchronously so the user hears something
+        # immediately. speak_direct restarts the conversation timer at the
+        # end; we cancel it again so the worker's output isn't raced by a
+        # timer expiry.
+        if SPEAK_CALENDAR_ACK:
+            try:
+                self.speak_direct("One moment, Sir.")
+            except Exception as e:
+                print(f"[Calendar] ack speak error: {e}")
+            self._cancel_conversation_timer()
+
+        # Re-establish thinking state after the ack (speak_direct sets idle
+        # at the end). The UI should show "thinking" during the real work.
+        ws_server.set_state("thinking")
+
+        worker = threading.Thread(
+            target=self._calendar_worker_body,
+            args=(intent, user_input),
+            daemon=True,
+            name="calendar-worker",
+        )
+        worker.start()
+
+    def _calendar_worker_body(self, intent: str, user_input: str) -> None:
+        """Runs in a background thread. Guarantees _calendar_working is
+        cleared and state is restored even on crash."""
+        try:
+            print(f"[Calendar] worker start intent={intent!r}")
+            if intent == "read_today":
+                self._cal_read_today()
+            elif intent == "read_upcoming":
+                self._cal_read_upcoming()
+            elif intent == "read_reminders":
+                self._cal_read_reminders()
+            elif intent == "create_event":
+                self._cal_create_event(user_input)
+            elif intent == "create_reminder":
+                self._cal_create_reminder(user_input)
+            else:
+                print(f"[Calendar] unknown intent: {intent!r}")
+        except RuntimeError as e:
+            # Known failure from calendar_reminders (timeout, permission, etc.)
+            print(f"[Calendar] AppleScript error: {e}")
+            self._safe_speak(
+                "I wasn't able to access your calendar, Sir — "
+                "you may need to grant permission in System Settings."
+            )
+        except Exception as e:
+            print(f"[Calendar] worker error: {e}")
+            import traceback
+            traceback.print_exc()
+            self._safe_speak(
+                "I ran into a problem handling that calendar request, Sir."
+            )
+        finally:
+            # Defensive: if the worker crashed mid-flight, clear any pending
+            # clarification so the next utterance isn't silently swallowed.
+            if self._pending_calendar_action is None:
+                pass  # nothing to clean up
+            self._calendar_working.clear()
+            # The last speak_direct call inside the handler already set
+            # state=idle and restarted the timer (if still in conversation).
+            # Belt-and-suspenders: if nothing got spoken, restore idle.
+            try:
+                ws_server.set_state("idle")
+            except Exception:
+                pass
+            if self._in_conversation:
+                try:
+                    self._start_conversation_timer()
+                except Exception:
+                    pass
+            print(f"[Calendar] worker done intent={intent!r}")
+
+    def _safe_speak(self, text: str) -> None:
+        """speak_direct wrapped in try/except — used from the worker
+        thread where an exception would otherwise leak unhandled."""
+        try:
+            self.speak_direct(text)
+        except Exception as e:
+            print(f"[Calendar] safe_speak error: {e}")
+
+    # ── Read handlers (worker thread) ───────────────────────────────────────
+
+    def _cal_read_today(self) -> None:
+        events = calendar_reminders.get_today_events()
+        if not events:
+            self._safe_speak("Your calendar is clear for today, Sir.")
+            return
+        lines = self._format_event_lines(events)
+        prompt = (
+            "These are the events on my calendar for today. Summarize them "
+            "naturally and conversationally in Jarvis's voice — not a list, "
+            "not a script, just how a sharp assistant would say it out loud. "
+            "Keep it to two to four sentences.\n\n"
+            + "\n".join(lines)
+        )
+        text = self._llm_silent(self._JARVIS_CAL_SYSTEM, prompt, max_tokens=220)
+        if text:
+            self._safe_speak(text)
+        else:
+            self._safe_speak("I had trouble summarizing your events, Sir.")
+
+    def _cal_read_upcoming(self) -> None:
+        events = calendar_reminders.get_upcoming_events()
+        if not events:
+            self._safe_speak("Nothing on the books for the rest of the week, Sir.")
+            return
+        lines = self._format_event_lines(events)
+        prompt = (
+            "These are the events on my calendar between now and the end of "
+            "this coming Saturday. Summarize them naturally and conversationally "
+            "in Jarvis's voice — not a list, not a script, just how a sharp "
+            "assistant would say it out loud. Group related items and mention "
+            "days, not full dates. Keep it to three to five sentences.\n\n"
+            + "\n".join(lines)
+        )
+        text = self._llm_silent(self._JARVIS_CAL_SYSTEM, prompt, max_tokens=260)
+        if text:
+            self._safe_speak(text)
+        else:
+            self._safe_speak("I had trouble summarizing your week, Sir.")
+
+    def _cal_read_reminders(self) -> None:
+        reminders = calendar_reminders.get_all_reminders()
+        if not reminders:
+            self._safe_speak("You have no open reminders, Sir.")
+            return
+        lines = []
+        for r in reminders:
+            parts = [f"- {r.get('title', '')}"]
+            if r.get("due"):
+                parts.append(f"due {r['due']}")
+            lines.append(" ".join(parts))
+        prompt = (
+            "These are the user's open reminders. Summarize them naturally "
+            "and conversationally in Jarvis's voice — not a list, not a "
+            "script, just how a sharp assistant would say them out loud. "
+            "Keep it brief, two to four sentences.\n\n"
+            + "\n".join(lines)
+        )
+        text = self._llm_silent(self._JARVIS_CAL_SYSTEM, prompt, max_tokens=220)
+        if text:
+            self._safe_speak(text)
+        else:
+            self._safe_speak("I had trouble summarizing your reminders, Sir.")
+
+    def _format_event_lines(self, events: list) -> list:
+        lines = []
+        for e in events:
+            parts = [f"- {e.get('title', '')}"]
+            if e.get("start"):
+                parts.append(f"starts {e['start']}")
+            if e.get("end"):
+                parts.append(f"ends {e['end']}")
+            if e.get("location"):
+                parts.append(f"at {e['location']}")
+            if e.get("calendar"):
+                parts.append(f"[{e['calendar']}]")
+            lines.append(" ".join(parts))
+        return lines
+
+    # ── Create handlers (worker thread) ─────────────────────────────────────
+
+    def _cal_create_event(self, user_input: str) -> None:
+        data_json = self._extract_event_json(user_input)
+        if not data_json:
+            self._safe_speak(
+                "I didn't quite catch that, Sir. Could you say it again a bit more clearly?"
+            )
+            return
+
+        # Route reminders through the reminder path if the LLM flagged it
+        if bool(data_json.get("is_reminder")):
+            self._cal_create_reminder(user_input, pre_extracted=data_json)
+            return
+
+        title = (data_json.get("title") or "New event").strip()
+        date_field = data_json.get("date") or "today"
+        start_time = data_json.get("start_time")
+        end_time = data_json.get("end_time")
+        location = data_json.get("location")
+        notes = data_json.get("notes")
+
+        resolved_date = self._resolve_relative_date(str(date_field))
+        st = self._parse_time(start_time) or (9, 0)
+        start_dt = datetime.datetime.combine(
+            resolved_date, datetime.time(st[0], st[1])
+        )
+        end_dt = None
+        et = self._parse_time(end_time)
+        if et is not None:
+            end_dt = datetime.datetime.combine(
+                resolved_date, datetime.time(et[0], et[1])
+            )
+
+        cal_name = calendar_reminders.classify_calendar(user_input)
+
+        data = {
+            "title": title,
+            "calendar": cal_name,
+            "start_datetime": start_dt,
+            "end_datetime": end_dt,
+            "location": location,
+            "notes": notes,
+            "raw_text": user_input,
+        }
+
+        # Memory-backed location logic. Only ask when the utterance
+        # signals a location-required event type AND no memory match.
+        if not location:
+            inferred = self._infer_location_memory_key(user_input)
+            if inferred is not None:
+                mem_key, question = inferred
+                stored = self._get_fact(mem_key)
+                if stored:
+                    data["location"] = stored
+                else:
+                    # Set pending state and ask the question. The next
+                    # user utterance will be routed to
+                    # _resume_pending_calendar_action by the main loop.
+                    self._pending_calendar_action = {
+                        "type": "create_event",
+                        "data": data,
+                        "waiting_for": "location",
+                        "memory_key": mem_key,
+                    }
+                    self._safe_speak(question)
+                    return
+
+        self._finalize_create_event(data)
+
+    def _finalize_create_event(self, data: dict) -> None:
+        """Actually create the event in Calendar.app + speak confirmation."""
+        try:
+            start_dt = data["start_datetime"]
+            end_dt = data.get("end_datetime")
+            assumed_end = False
+            if end_dt is None:
+                end_dt = start_dt + datetime.timedelta(hours=1)
+                assumed_end = True
+
+            calendar_reminders.create_calendar_event(
+                title=data["title"],
+                calendar_name=data["calendar"],
+                start_datetime=start_dt,
+                end_datetime=end_dt,
+                location=data.get("location"),
+                notes=data.get("notes"),
+            )
+        except Exception as e:
+            print(f"[Calendar] create_calendar_event error: {e}")
+            self._safe_speak(
+                "I wasn't able to create that event, Sir — "
+                "you may need to grant calendar permission in System Settings."
+            )
+            return
+
+        when = start_dt.strftime("%A %B %-d at %-I:%M %p")
+        end_str = end_dt.strftime("%-I:%M %p")
+        loc_str = f" at {data['location']}" if data.get("location") else ""
+        end_clause = (
+            f" The end time was assumed as a 1-hour default ({end_str})."
+            if assumed_end else f" It ends at {end_str}."
+        )
+        action_desc = (
+            f"Created an event titled '{data['title']}' on {when}{loc_str} "
+            f"in the {data['calendar']} calendar.{end_clause}"
+        )
+        confirm_prompt = (
+            "Confirm this calendar action naturally and conversationally — "
+            "not scripted, not robotic. If an end time was assumed as a "
+            "1-hour default, mention it briefly and offer to change it. "
+            f"Action: {action_desc} "
+            "Keep it to two to three sentences max."
+        )
+        text = self._llm_silent(self._JARVIS_CAL_SYSTEM, confirm_prompt, max_tokens=160)
+        if text:
+            self._safe_speak(text)
+        else:
+            # LLM failed — speak a plain confirmation so the user still
+            # knows it worked.
+            self._safe_speak(f"Done, Sir. I added {data['title']} to your calendar.")
+
+    def _cal_create_reminder(
+        self, user_input: str, pre_extracted: Optional[dict] = None
+    ) -> None:
+        data_json = pre_extracted or self._extract_event_json(user_input)
+        if not data_json:
+            self._safe_speak(
+                "I didn't quite catch that, Sir. Could you say it again?"
+            )
+            return
+
+        title = (data_json.get("title") or "Reminder").strip()
+        notes = data_json.get("notes")
+        date_field = data_json.get("date")
+        start_time = data_json.get("start_time")
+
+        due_dt: Optional[datetime.datetime] = None
+        if date_field or start_time:
+            resolved_date = self._resolve_relative_date(
+                str(date_field or "today")
+            )
+            st = self._parse_time(start_time) or (9, 0)
+            due_dt = datetime.datetime.combine(
+                resolved_date, datetime.time(st[0], st[1])
+            )
+
+        try:
+            calendar_reminders.create_reminder(
+                title=title, due_datetime=due_dt, notes=notes
+            )
+        except Exception as e:
+            print(f"[Calendar] create_reminder error: {e}")
+            self._safe_speak(
+                "I wasn't able to create that reminder, Sir — "
+                "you may need to grant reminders permission in System Settings."
+            )
+            return
+
+        if due_dt:
+            when = due_dt.strftime("%A %B %-d at %-I:%M %p")
+            action_desc = f"Created a reminder '{title}' due {when}."
+        else:
+            action_desc = f"Created a reminder '{title}' with no specific due date."
+        confirm_prompt = (
+            "Confirm this reminder action naturally and conversationally — "
+            "not scripted, not robotic. "
+            f"Action: {action_desc} "
+            "Keep it to one to two sentences max."
+        )
+        text = self._llm_silent(self._JARVIS_CAL_SYSTEM, confirm_prompt, max_tokens=140)
+        if text:
+            self._safe_speak(text)
+        else:
+            self._safe_speak(f"Done, Sir. I added '{title}' to your reminders.")
+
+    # ── Pending clarification resume ────────────────────────────────────────
+
+    def _resume_pending_calendar_action(self, answer: str) -> None:
+        """Called by the main loop (not the worker) when a clarifying
+        question is pending and the user has just answered it. Starts a
+        new background worker to finish the action."""
+        pending = self._pending_calendar_action
+        self._pending_calendar_action = None
+        if not pending:
+            return
+
+        waiting_for = pending.get("waiting_for")
+        data = pending.get("data", {})
+        atype = pending.get("type")
+
+        if waiting_for != "location" or atype != "create_event":
+            self._safe_speak("I'm not sure what to do with that, Sir.")
+            return
+
+        loc = (answer or "").strip().rstrip(".?!,;:")
+        if not loc:
+            self._safe_speak("I didn't catch a location, Sir. Try again.")
+            return
+
+        # Persist silently so we never have to ask again.
+        mem_key = pending.get("memory_key")
+        if mem_key:
+            try:
+                memory.save_fact(mem_key, loc)
+                self._rebuild_system_prompt()
+                print(f"[Calendar] Saved memory {mem_key} = {loc}")
+            except Exception as e:
+                print(f"[Calendar] save fact error: {e}")
+        data["location"] = loc
+
+        # Finish the event creation on a fresh background worker so the
+        # main loop stays responsive — same safety contract as the
+        # original dispatch path.
+        self._cancel_conversation_timer()
+        self._calendar_working.set()
+        ws_server.set_state("thinking")
+
+        def _finish():
+            try:
+                self._finalize_create_event(data)
+            except Exception as e:
+                print(f"[Calendar] resume finalize error: {e}")
+                self._safe_speak(
+                    "I wasn't able to finish creating that event, Sir."
+                )
+            finally:
+                self._calendar_working.clear()
+                try:
+                    ws_server.set_state("idle")
+                except Exception:
+                    pass
+                if self._in_conversation:
+                    try:
+                        self._start_conversation_timer()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_finish, daemon=True,
+                         name="calendar-resume").start()
+
     # ── Spinner ───────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -1638,6 +2309,16 @@ class VoiceAssistant:
                     self._return_to_wake.clear()
                     continue
 
+                # ── Calendar worker guard ─────────────────────────────────
+                # A background calendar worker is running. The worker is
+                # responsible for speaking the result and restoring state.
+                # Skip audio capture entirely until it finishes so we don't
+                # record the assistant's own "one moment, Sir" output and
+                # we don't race the worker's state updates.
+                if self._calendar_working.is_set():
+                    time.sleep(0.1)
+                    continue
+
                 # CONVERSATION MODE: full voice pipeline
                 # Check pending Mac power confirmation first
                 if (self.pending_confirmation is not None):
@@ -1688,6 +2369,14 @@ class VoiceAssistant:
                 self._cancel_conversation_timer()
 
                 print(f"You: {user_input}")
+
+                # Pending calendar clarification (e.g. "Where are you
+                # working, Sir?"). Route the user's answer back into the
+                # pending action, don't treat it as a new command.
+                if self._pending_calendar_action is not None:
+                    self._resume_pending_calendar_action(user_input)
+                    print()
+                    continue
 
                 remember_fact = memory.detect_remember_command(user_input)
                 if remember_fact:
@@ -1787,13 +2476,28 @@ class VoiceAssistant:
                 # Clipboard augmentation
                 augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
 
-                # System command or LLM
+                # System command, calendar intent, or LLM
                 sys_response = self._handle_system_command(user_input)
+                cal_intent = None
+                if not sys_response:
+                    # Only probe calendar intent when no system command
+                    # matched — keeps timer-style reminders ("remind me in
+                    # 5 minutes") on their existing fast path. Intent
+                    # detection is strict regex only; casual chat falls
+                    # through to None.
+                    cal_intent = self._detect_calendar_intent(user_input)
+
                 if sys_response and sys_response != WAKE_MODE_SENTINEL:
                     print(f"System: {sys_response}")
                     self.speak_direct(sys_response)
                 elif sys_response == WAKE_MODE_SENTINEL:
                     pass  # Already spoken and handled inside the command
+                elif cal_intent is not None:
+                    print(f"[Calendar] Intent: {cal_intent}")
+                    # Kicks off a background worker and returns immediately.
+                    # Main loop will idle on _calendar_working until the
+                    # worker finishes.
+                    self._handle_calendar_command(cal_intent, user_input)
                 else:
                     # Build the one-turn memory context block if we have search hits.
                     memory_context: Optional[str] = None
