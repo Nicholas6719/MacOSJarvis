@@ -241,6 +241,11 @@ class VoiceAssistant:
 
         # Wake word state
         self._in_conversation = False
+        # Set True immediately after the wake word fires, cleared as soon
+        # as the run loop processes the first post-wake utterance. Used
+        # by the run loop to discard an accidental transcription of the
+        # wake phrase itself (e.g. "Hey Jarvis") as if it were a command.
+        self._just_woke = False
         self._conversation_timer: Optional[threading.Timer] = None
         self._return_to_wake = threading.Event()
         self._wake_model: Optional[WakeWordModel] = None
@@ -2292,10 +2297,21 @@ class VoiceAssistant:
                     # WAKE MODE: listen for wake word
                     detected = self._listen_for_wake_word()
                     if detected:
+                        # Longer drain + sleep after wake-word fires. Fixes
+                        # the "Jarvis transcribes my wake phrase as the
+                        # first command" bug — the mic was catching the
+                        # tail of the user's own 'Hey Jarvis' and sending
+                        # it straight to STT. A full second of silence
+                        # between wake detection and first mic capture
+                        # clears the user's voice and any wake-word echo.
+                        time.sleep(1.0)
                         self._drain_q()
-                        time.sleep(0.3)
                         self._in_conversation = True
                         self._return_to_wake.clear()
+                        # Mark this turn as the first post-wake utterance
+                        # so the run loop can discard an echo of the
+                        # wake phrase if it slips through anyway.
+                        self._just_woke = True
                         self._start_conversation_timer()
                         ws_server.set_state("listening")
                         print(
@@ -2364,6 +2380,49 @@ class VoiceAssistant:
                 if not user_input:
                     print("  (Didn't catch that — try again)\n")
                     continue  # Timer keeps running — don't touch it
+
+                # Wake-phrase echo defense. If the first utterance after
+                # the wake word starts with "hey jarvis" / "hi jarvis" /
+                # "jarvis", we need to handle two cases:
+                #
+                #   a) The whole utterance IS just the wake phrase — the
+                #      mic caught the tail of the user's own "Hey Jarvis"
+                #      and there's no real command. Discard and keep
+                #      listening for the next one.
+                #
+                #   b) The utterance is "hey jarvis <command>" said in one
+                #      breath. Strip the wake prefix and use the remainder
+                #      as the actual command.
+                #
+                # Only applies once per wake-up — the flag is cleared
+                # immediately whether we keep, strip, or discard.
+                if self._just_woke:
+                    self._just_woke = False
+                    _cleaned = re.sub(r"[^\w\s]", "", user_input).strip().lower()
+                    _PREFIXES = (
+                        "hey jarvis", "hi jarvis", "hello jarvis",
+                        "hey jervis", "hey jarvus", "hey jarbis",
+                    )
+                    _matched_prefix = None
+                    for p in _PREFIXES:
+                        if _cleaned.startswith(p):
+                            _matched_prefix = p
+                            break
+                    if _matched_prefix is None and _cleaned == "jarvis":
+                        print(f"  (Ignoring bare wake-phrase echo: {user_input!r})\n")
+                        continue
+                    if _matched_prefix is not None:
+                        _remainder = _cleaned[len(_matched_prefix):].strip()
+                        # Tolerate trailing "hey" or similar junk
+                        _remainder = re.sub(r"^(hey|hi|hello)\s+", "", _remainder)
+                        if not _remainder:
+                            print(f"  (Ignoring wake-phrase echo: {user_input!r})\n")
+                            continue
+                        # The user said wake phrase + command in one breath.
+                        # Replace user_input with just the command portion
+                        # so the rest of the pipeline sees a clean command.
+                        print(f"  (Stripped wake prefix: {user_input!r} -> {_remainder!r})")
+                        user_input = _remainder
 
                 # Confirmed speech — cancel timer while Jarvis processes and responds
                 self._cancel_conversation_timer()

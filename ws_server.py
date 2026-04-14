@@ -18,7 +18,10 @@ import http.server
 import json
 import logging
 import os
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 from typing import Set
 
@@ -245,6 +248,121 @@ def _serve_http() -> None:
         httpd.serve_forever()
 
 
+# ── Stale-process cleanup ────────────────────────────────────────────────────
+#
+# When Jarvis is stopped forcefully from Xcode (Stop button, window closed
+# mid-launch, crash, etc.), the Python subprocess can leak — leaving the
+# previous Jarvis holding ports 3000 and 8765. On the next launch,
+# `socket.bind(...)` fails with `OSError: [Errno 48] Address already in use`
+# and both servers die in background threads before the main event loop
+# ever sees them, leaving the UI permanently dark.
+#
+# Setting SO_REUSEADDR doesn't help on macOS for this case — it only covers
+# TIME_WAIT state, not a live process holding the port. The correct fix is
+# to detect the conflict up front, identify whether it's a stray Jarvis,
+# and kill it cleanly before we try to bind.
+
+def _pids_on_port(port: int) -> list[int]:
+    """Return PIDs currently bound to `port`, via `lsof -ti`. Empty list on
+    any error (lsof missing, permission denied, nothing bound, etc.)."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f":{port}"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return []
+    pids: list[int] = []
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.append(int(line))
+    return pids
+
+
+def _is_stale_jarvis(pid: int) -> bool:
+    """True if `pid` is a Python process running chatbot_speech_to_speech.py
+    (or some other Jarvis entry-point script). We only auto-kill processes
+    that look like previous Jarvis instances — never random other apps
+    that happen to be using the port."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return False
+    cmd = (result.stdout or "").strip().lower()
+    if not cmd:
+        return False
+    return (
+        "python" in cmd
+        and ("chatbot_speech_to_speech" in cmd or "jarvis" in cmd)
+    )
+
+
+def _ensure_port_free(port: int, label: str) -> None:
+    """If `port` is held by a stale Jarvis Python process, kill it and wait
+    for the OS to release the socket. If held by something else, print a
+    loud warning so the user knows exactly which process is the culprit.
+
+    This is safe to run on every startup — it's a no-op when the port is
+    already free."""
+    pids = _pids_on_port(port)
+    if not pids:
+        return
+
+    killed_any = False
+    for pid in pids:
+        if _is_stale_jarvis(pid):
+            msg = (
+                f"[ws_server] port {port} ({label}) is held by a stale Jarvis "
+                f"process PID {pid} — killing it so the new instance can bind"
+            )
+            print(msg, flush=True)
+            logger.warning(msg)
+            try:
+                os.kill(pid, 9)
+                killed_any = True
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                print(f"[ws_server] failed to kill PID {pid}: {e}", flush=True)
+        else:
+            # Something that isn't Jarvis is on the port. Do NOT auto-kill
+            # arbitrary processes — just tell the user loudly.
+            try:
+                ps = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "command="],
+                    capture_output=True, text=True, timeout=3,
+                )
+                cmd = (ps.stdout or "").strip()
+            except Exception:
+                cmd = "(unknown)"
+            msg = (
+                f"[ws_server] port {port} ({label}) is held by NON-Jarvis "
+                f"process PID {pid}: {cmd!r}. Close it manually and "
+                f"restart Jarvis."
+            )
+            print(msg, flush=True)
+            logger.error(msg)
+
+    if killed_any:
+        # Give the kernel a moment to release the socket before we bind.
+        time.sleep(0.5)
+        remaining = _pids_on_port(port)
+        if remaining:
+            print(
+                f"[ws_server] port {port} still held by {remaining} after kill attempt — "
+                f"the new server may fail to bind",
+                flush=True,
+            )
+
+
 def start() -> None:
     """Start both the WebSocket server and the static HTTP server."""
     global _loop, _servers_started
@@ -254,6 +372,12 @@ def start() -> None:
             return
         _servers_started = True
 
+    # Proactively clear ports before binding — fixes the "UI never comes up"
+    # class of failures caused by a leaked Python subprocess from a previous
+    # Xcode/JarvisApp run.
+    _ensure_port_free(PORT, "WebSocket")
+    _ensure_port_free(HTTP_PORT, "HTTP")
+
     def _run_ws() -> None:
         global _loop
         _loop = asyncio.new_event_loop()
@@ -261,9 +385,27 @@ def start() -> None:
         try:
             _loop.run_until_complete(_serve())
         except Exception as exc:
-            logger.warning("[ws_server] stopped: %s", exc)
+            # Print in addition to logging — logging isn't configured so
+            # log calls alone would vanish, leaving the user with no idea
+            # why the WebSocket is down.
+            msg = f"[ws_server] WebSocket server stopped: {exc}"
+            print(msg, file=sys.stderr, flush=True)
+            logger.warning(msg)
 
-    threading.Thread(target=_run_ws,    daemon=True, name="ws-server").start()
-    threading.Thread(target=_serve_http, daemon=True, name="http-server").start()
+    def _run_http() -> None:
+        """Wrap _serve_http with explicit error reporting so a bind failure
+        surfaces as a clear message instead of an unhandled thread exception."""
+        try:
+            _serve_http()
+        except Exception as exc:
+            msg = (
+                f"[http-server] HTTP server stopped: {exc}. "
+                f"The UI at http://localhost:{HTTP_PORT} will not be available."
+            )
+            print(msg, file=sys.stderr, flush=True)
+            logger.error(msg)
+
+    threading.Thread(target=_run_ws,   daemon=True, name="ws-server").start()
+    threading.Thread(target=_run_http, daemon=True, name="http-server").start()
 
     logger.info("[ws_server] started on ws://localhost:%d", PORT)
