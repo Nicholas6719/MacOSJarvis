@@ -1706,22 +1706,33 @@ class VoiceAssistant:
                     # Let the LLM respond naturally below
 
                 # Level 4: Memory search — detect questions about past
-                # context and retrieve matching rows via FTS5. Runs after
-                # remember/forget so those always take priority, and before
-                # auto-detect so it can't trigger a fact save.
-                search_query = memory.detect_memory_search_query(user_input)
+                # context and retrieve matching rows via FTS5, optionally
+                # filtered by a parsed date range. Runs after remember/forget
+                # so those always take priority, and before auto-detect so
+                # it can't trigger a fact save.
+                search_spec = memory.detect_memory_search_query(user_input)
                 memory_search_results: list = []
-                if search_query:
-                    memory_search_results = memory.search_memory(search_query)
+                if search_spec:
+                    terms = search_spec.get("terms", "") or ""
+                    dr = search_spec.get("date_range")
+                    memory_search_results = memory.search_memory(
+                        query=terms,
+                        date_range=dr,
+                    )
+                    # Human-readable description for the terminal.
+                    if dr and terms:
+                        desc = f"terms='{terms}' in range {dr[0][:10]}..{dr[1][:10]}"
+                    elif dr:
+                        desc = f"range {dr[0][:10]}..{dr[1][:10]}"
+                    else:
+                        desc = f"terms='{terms}'"
                     if memory_search_results:
                         print(
-                            f"[Memory] Search query: '{search_query}' — "
+                            f"[Memory] Search {desc} — "
                             f"{len(memory_search_results)} result(s) found."
                         )
                     else:
-                        print(
-                            f"[Memory] Search query: '{search_query}' — no results."
-                        )
+                        print(f"[Memory] Search {desc} — no results.")
 
                 # Auto-detect a casually mentioned personal fact (Level 2)
                 if not remember_fact and not forget_term:

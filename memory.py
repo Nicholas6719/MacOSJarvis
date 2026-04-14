@@ -8,6 +8,7 @@ SQLite-backed memory that survives restarts. Stores:
 Uses only Python's built-in sqlite3 — no new dependencies.
 """
 
+import calendar
 import sqlite3
 import datetime
 import json as _json
@@ -745,63 +746,154 @@ class MemoryManager:
         words = [w for w in cleaned.split() if w and w not in _SEARCH_STOP_WORDS]
         return " ".join(words)
 
-    def search_memory(self, query: str, max_results: int = 5) -> list:
-        """Full-text search across conversations and summaries. Returns a
-        combined, ranked list of result dicts (max `max_results` total).
-        Returns [] on any error or if the cleaned query is too short."""
+    def search_memory(
+        self,
+        query: str = "",
+        max_results: int = 5,
+        date_range=None,
+    ) -> list:
+        """Full-text search across conversations and summaries, with optional
+        timestamp-range filtering (Level 4+).
+
+        query      — free text (cleaned to FTS5 MATCH terms). May be empty
+                     when the caller is doing a pure date-range lookup.
+        date_range — optional (start_iso, end_iso) tuple. When present, both
+                     FTS queries are restricted to rows inside the window; if
+                     `query` is empty, a plain SELECT against the window is
+                     used and results are ordered by timestamp ASC.
+
+        Returns a combined list of result dicts (max `max_results` total).
+        Returns [] on any error."""
         try:
-            cleaned = self._clean_search_query(query)
-            if not cleaned or len(cleaned) < 3:
+            cleaned = self._clean_search_query(query) if query else ""
+            has_terms = bool(cleaned) and len(cleaned) >= 3
+            has_range = (
+                date_range is not None
+                and isinstance(date_range, tuple)
+                and len(date_range) == 2
+                and date_range[0]
+                and date_range[1]
+            )
+
+            # Nothing to search on — bail early.
+            if not has_terms and not has_range:
                 return []
 
-            # FTS5 MATCH accepts space-separated terms (implicit AND/OR per
-            # FTS5 grammar). Use them as-is since _clean_search_query already
-            # stripped all special characters.
-            results = []
+            results: list = []
 
-            try:
-                cur = self._conn.execute(
-                    "SELECT c.id, c.role, c.content, c.timestamp "
-                    "FROM conversations_fts f "
-                    "JOIN conversations c ON c.id = f.rowid "
-                    "WHERE conversations_fts MATCH ? "
-                    "ORDER BY rank LIMIT ?",
-                    (cleaned, max_results),
-                )
-                for cid, role, content, ts in cur.fetchall():
-                    results.append(
-                        {
-                            "source": "conversation",
-                            "id": cid,
-                            "role": role,
-                            "content": content or "",
-                            "timestamp": ts or "",
-                        }
-                    )
-            except Exception as e:
-                print(f"[Memory] conversations_fts MATCH error: {e}")
+            if has_terms:
+                # FTS5 MATCH + optional date-range filter.
+                try:
+                    if has_range:
+                        cur = self._conn.execute(
+                            "SELECT c.id, c.role, c.content, c.timestamp "
+                            "FROM conversations_fts f "
+                            "JOIN conversations c ON c.id = f.rowid "
+                            "WHERE conversations_fts MATCH ? "
+                            "AND c.timestamp BETWEEN ? AND ? "
+                            "ORDER BY rank LIMIT ?",
+                            (cleaned, date_range[0], date_range[1], max_results),
+                        )
+                    else:
+                        cur = self._conn.execute(
+                            "SELECT c.id, c.role, c.content, c.timestamp "
+                            "FROM conversations_fts f "
+                            "JOIN conversations c ON c.id = f.rowid "
+                            "WHERE conversations_fts MATCH ? "
+                            "ORDER BY rank LIMIT ?",
+                            (cleaned, max_results),
+                        )
+                    for cid, role, content, ts in cur.fetchall():
+                        results.append(
+                            {
+                                "source": "conversation",
+                                "id": cid,
+                                "role": role,
+                                "content": content or "",
+                                "timestamp": ts or "",
+                            }
+                        )
+                except Exception as e:
+                    print(f"[Memory] conversations_fts MATCH error: {e}")
 
-            try:
-                cur = self._conn.execute(
-                    "SELECT s.id, s.summary_text, s.date_from, s.date_to "
-                    "FROM summaries_fts f "
-                    "JOIN summaries s ON s.id = f.rowid "
-                    "WHERE summaries_fts MATCH ? "
-                    "ORDER BY rank LIMIT ?",
-                    (cleaned, max_results),
-                )
-                for sid, text, dfrom, dto in cur.fetchall():
-                    results.append(
-                        {
-                            "source": "summary",
-                            "id": sid,
-                            "summary_text": text or "",
-                            "date_from": dfrom or "",
-                            "date_to": dto or "",
-                        }
+                try:
+                    if has_range:
+                        # Summaries "overlap" the window when the summary's
+                        # date_from falls inside it. Cheap overlap check.
+                        cur = self._conn.execute(
+                            "SELECT s.id, s.summary_text, s.date_from, s.date_to "
+                            "FROM summaries_fts f "
+                            "JOIN summaries s ON s.id = f.rowid "
+                            "WHERE summaries_fts MATCH ? "
+                            "AND s.date_from BETWEEN ? AND ? "
+                            "ORDER BY rank LIMIT ?",
+                            (cleaned, date_range[0], date_range[1], max_results),
+                        )
+                    else:
+                        cur = self._conn.execute(
+                            "SELECT s.id, s.summary_text, s.date_from, s.date_to "
+                            "FROM summaries_fts f "
+                            "JOIN summaries s ON s.id = f.rowid "
+                            "WHERE summaries_fts MATCH ? "
+                            "ORDER BY rank LIMIT ?",
+                            (cleaned, max_results),
+                        )
+                    for sid, text, dfrom, dto in cur.fetchall():
+                        results.append(
+                            {
+                                "source": "summary",
+                                "id": sid,
+                                "summary_text": text or "",
+                                "date_from": dfrom or "",
+                                "date_to": dto or "",
+                            }
+                        )
+                except Exception as e:
+                    print(f"[Memory] summaries_fts MATCH error: {e}")
+
+            else:
+                # Date-only lookup — no FTS, just a plain window slice.
+                try:
+                    cur = self._conn.execute(
+                        "SELECT id, role, content, timestamp "
+                        "FROM conversations "
+                        "WHERE timestamp BETWEEN ? AND ? "
+                        "ORDER BY timestamp ASC LIMIT ?",
+                        (date_range[0], date_range[1], max_results),
                     )
-            except Exception as e:
-                print(f"[Memory] summaries_fts MATCH error: {e}")
+                    for cid, role, content, ts in cur.fetchall():
+                        results.append(
+                            {
+                                "source": "conversation",
+                                "id": cid,
+                                "role": role,
+                                "content": content or "",
+                                "timestamp": ts or "",
+                            }
+                        )
+                except Exception as e:
+                    print(f"[Memory] conversations range lookup error: {e}")
+
+                try:
+                    cur = self._conn.execute(
+                        "SELECT id, summary_text, date_from, date_to "
+                        "FROM summaries "
+                        "WHERE date_from BETWEEN ? AND ? "
+                        "ORDER BY date_from ASC LIMIT ?",
+                        (date_range[0], date_range[1], max_results),
+                    )
+                    for sid, text, dfrom, dto in cur.fetchall():
+                        results.append(
+                            {
+                                "source": "summary",
+                                "id": sid,
+                                "summary_text": text or "",
+                                "date_from": dfrom or "",
+                                "date_to": dto or "",
+                            }
+                        )
+                except Exception as e:
+                    print(f"[Memory] summaries range lookup error: {e}")
 
             # Cap total at max_results, preferring summaries first (they're
             # higher signal per row), then falling back to conversation hits.
@@ -813,15 +905,91 @@ class MemoryManager:
             print(f"[Memory] search_memory error: {e}")
             return []
 
+    def _parse_date_range_from_text(self, text: str):
+        """Extract a (start_iso, end_iso) UTC window from a user utterance if
+        the text references a month, optionally with a year and/or a day-of-month.
+
+        Returns a tuple (start, end) or None. Only handles absolute dates —
+        no relative phrases like 'yesterday' or 'last week'.
+
+        Supported shapes:
+          - 'April 2026'            → whole month of April 2026
+          - 'April'                 → whole month of April in the current year
+          - 'April 14'              → single day, 2026-04-14 (or current year)
+          - 'April 14th 2026'       → single day
+          - 'on April 14th'         → single day
+        """
+        try:
+            if not text:
+                return None
+            lowered = text.lower()
+            # Month
+            month_names = list(_MONTHS)
+            month_num = None
+            month_match = re.search(
+                rf"\b({'|'.join(month_names)})\b", lowered
+            )
+            if not month_match:
+                return None
+            month_num = month_names.index(month_match.group(1)) + 1
+
+            # Optional 4-digit year anywhere in the sentence.
+            year = None
+            year_match = re.search(r"\b(19|20)\d{2}\b", lowered)
+            if year_match:
+                year = int(year_match.group(0))
+            else:
+                year = datetime.datetime.utcnow().year
+
+            # Optional day-of-month following the month name, e.g. "april 14",
+            # "april 14th", "april 2nd".
+            day = None
+            day_match = re.search(
+                rf"\b{month_match.group(1)}\s+(\d{{1,2}})(?:st|nd|rd|th)?\b",
+                lowered,
+            )
+            if day_match:
+                d = int(day_match.group(1))
+                if 1 <= d <= 31:
+                    day = d
+
+            # Guard against impossible dates like Feb 30.
+            last_day = calendar.monthrange(year, month_num)[1]
+            if day is not None and day > last_day:
+                day = last_day
+
+            if day is not None:
+                start = datetime.datetime(year, month_num, day, 0, 0, 0)
+                end = datetime.datetime(year, month_num, day, 23, 59, 59)
+            else:
+                start = datetime.datetime(year, month_num, 1, 0, 0, 0)
+                end = datetime.datetime(
+                    year, month_num, last_day, 23, 59, 59
+                )
+
+            return (start.isoformat(), end.isoformat())
+        except Exception as e:
+            print(f"[Memory] _parse_date_range_from_text error: {e}")
+            return None
+
     def detect_memory_search_query(self, text: str):
-        """Return a cleaned search term if the user's question is clearly
-        about retrieving past memory. Return None otherwise. Never overlaps
-        with remember/forget/readback command handlers."""
+        """Detect whether a user utterance is a memory-retrieval question.
+
+        Returns a dict with two keys:
+            {
+                "terms":      "<cleaned FTS keyword string, possibly empty>",
+                "date_range": (start_iso, end_iso) or None,
+            }
+        or None if the utterance is not a memory-search question at all.
+
+        Never overlaps with remember/forget/readback command handlers.
+        Date triggers are checked BEFORE phrase triggers so that questions
+        like 'in April 2026 what were we talking about' produce a proper
+        (keywords, date_range) pair rather than a stale keyword lookup."""
         try:
             if not text:
                 return None
             t = text.strip()
-            # Must be substantial — at least 4 words total.
             if len(t.split()) < 4:
                 return None
 
@@ -838,63 +1006,72 @@ class MemoryManager:
                 return None
             if "what facts do you have about me" in lowered:
                 return None
-            # Remember command patterns (save, not search).
             for rt in _REMEMBER_TRIGGERS:
                 if rt in lowered:
                     return None
-            # Forget command patterns (delete, not search).
             for ft in _FORGET_TRIGGERS:
                 if ft in lowered:
                     return None
 
-            # Direct phrase triggers — simple substring tests first.
-            simple_triggers = (
-                "do you remember when",
-                "do you remember what",
-                "what were we talking about",
-                "what was i working on",
-                "what did i say about",
-                "what did we talk about",
-                "what have i told you about",
-                "remember when i",
-                "do you recall",
-            )
+            months_group = "|".join(_MONTHS)
             matched_trigger = None
-            for trig in simple_triggers:
-                if trig in lowered:
-                    matched_trigger = trig
-                    break
+            is_date_trigger = False
 
-            if matched_trigger is None:
-                # "back in <month>" — always a trigger.
-                m = re.search(
-                    rf"\bback in ({'|'.join(_MONTHS)})\b", lowered
-                )
-                if m:
-                    matched_trigger = m.group(0)
+            # ── Date triggers (checked FIRST) ────────────────────────────
+            # "back in <month>" — always a trigger.
+            m = re.search(rf"\bback in ({months_group})\b", lowered)
+            if m:
+                matched_trigger = m.group(0)
+                is_date_trigger = True
 
+            # "in <month>" when followed by 4-digit year or "when i"/"that i".
             if matched_trigger is None:
-                # "in <month>" ONLY when followed by a 4-digit year or
-                # "when i" / "that i".
                 m = re.search(
-                    rf"\bin ({'|'.join(_MONTHS)})(?:\s+(\d{{4}}|when i|that i))",
+                    rf"\bin ({months_group})(?:\s+(\d{{4}}|when i|that i))",
                     lowered,
                 )
                 if m:
                     matched_trigger = m.group(0)
+                    is_date_trigger = True
 
+            # "in <month> <year>" — same but with a raw 4-digit year.
             if matched_trigger is None:
-                # "on <month> <day>" e.g. "on April 14th".
                 m = re.search(
-                    rf"\bon ({'|'.join(_MONTHS)})\s+\d+",
-                    lowered,
+                    rf"\bin ({months_group})\s+\d{{4}}\b", lowered
                 )
                 if m:
                     matched_trigger = m.group(0)
+                    is_date_trigger = True
 
+            # "on <month> <day>" e.g. "on April 14th".
             if matched_trigger is None:
-                # "what do i usually X" — require at least one topic word
-                # after "usually".
+                m = re.search(
+                    rf"\bon ({months_group})\s+\d+", lowered
+                )
+                if m:
+                    matched_trigger = m.group(0)
+                    is_date_trigger = True
+
+            # ── Phrase triggers (checked SECOND) ─────────────────────────
+            if matched_trigger is None:
+                simple_triggers = (
+                    "do you remember when",
+                    "do you remember what",
+                    "what were we talking about",
+                    "what was i working on",
+                    "what did i say about",
+                    "what did we talk about",
+                    "what have i told you about",
+                    "remember when i",
+                    "do you recall",
+                )
+                for trig in simple_triggers:
+                    if trig in lowered:
+                        matched_trigger = trig
+                        break
+
+            # "what do i usually X" — require topic word(s) after "usually".
+            if matched_trigger is None:
                 m = re.search(r"\bwhat do i usually (\w+(?:\s+\w+)+)", lowered)
                 if m:
                     matched_trigger = "what do i usually"
@@ -902,17 +1079,44 @@ class MemoryManager:
             if matched_trigger is None:
                 return None
 
-            # Strip the trigger from the text and clean what remains.
+            # Parse a date range from the WHOLE original text — we want to
+            # catch dates even when the primary trigger was a phrase trigger
+            # like "what were we talking about in April 2026".
+            date_range = self._parse_date_range_from_text(t)
+
+            # Strip the primary trigger from the text and clean what remains
+            # into FTS terms.
             idx = lowered.find(matched_trigger)
             remainder = (
                 lowered[:idx] + lowered[idx + len(matched_trigger):]
             ).strip()
             remainder = remainder.rstrip("?.!,").strip()
-
             cleaned = self._clean_search_query(remainder)
-            if not cleaned or len(cleaned) < 3:
+
+            # Whenever we successfully parsed a date range, strip month names,
+            # years, day numbers, and bare ordinal suffixes from the FTS terms
+            # so the keyword lookup doesn't get polluted with date tokens.
+            if date_range is not None and cleaned:
+                _ordinal_tokens = {"st", "nd", "rd", "th"}
+                cleaned_tokens = [
+                    w for w in cleaned.split()
+                    if w not in _MONTHS
+                    and w not in _ordinal_tokens
+                    and not re.fullmatch(r"\d{4}", w)
+                    and not re.fullmatch(r"\d{1,2}(st|nd|rd|th)?", w)
+                ]
+                cleaned = " ".join(cleaned_tokens)
+
+            # Require at least ONE useful signal.
+            has_terms = bool(cleaned) and len(cleaned) >= 3
+            has_range = date_range is not None
+            if not has_terms and not has_range:
                 return None
-            return cleaned
+
+            return {
+                "terms": cleaned if has_terms else "",
+                "date_range": date_range,
+            }
         except Exception as e:
             print(f"[Memory] detect_memory_search_query error: {e}")
             return None
