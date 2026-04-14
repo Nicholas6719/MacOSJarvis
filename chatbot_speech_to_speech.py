@@ -75,6 +75,9 @@ STARTUP_MODE = os.environ.get("JARVIS_STARTUP_MODE", "wake")
 WAKE_MODE_SENTINEL = "__WAKE_MODE__"
 NOISE_FLOOR_RMS = 150  # Minimum RMS energy to consider audio as speech
 
+# Level 3 memory: speak a brief line when summarization starts? Set False for silent.
+SPEAK_MEMORY_UPDATE = True
+
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 CLAUSE_RE   = re.compile(r"(?<=[,;:])\s+")
 MIN_CLAUSE_WORDS = 8
@@ -206,6 +209,8 @@ class VoiceAssistant:
         self.system_prompt: str = ""
         self._rebuild_system_prompt()
         self._pending_memory_ack = False
+        self._needs_wake_summarization = True  # Fires on first wake-mode iteration
+        self._summarizing = False              # Prevent concurrent summarization runs
         self._stop_speak = threading.Event()
         self._tts_speaking = False
         self._cancel_timer = threading.Event()
@@ -734,6 +739,7 @@ class VoiceAssistant:
         self._return_to_wake.set()
         ws_server.set_state("wake")
         self._close_wake_stream()
+        self._needs_wake_summarization = True  # Level 3: re-check on wake entry
         print("\n[WAKE] Returning to wake mode", flush=True)
         # Drain audio and wait for residual TTS audio to clear
         time.sleep(2.0)
@@ -1233,13 +1239,106 @@ class VoiceAssistant:
         except Exception as e:
             print(f"[Memory] ack speak error: {e}")
 
+    def _summarize_old_exchanges(self) -> None:
+        """Level 3 memory: find conversation rows outside the active 20-turn
+        window that have not yet been summarized, batch them into groups of 10,
+        and use a silent internal LLM call to produce a 2-3 sentence summary
+        for each batch. Runs on a background thread from the wake-mode hook."""
+        if self._summarizing:
+            return
+        self._summarizing = True
+        try:
+            unsummarized = memory.get_unsummarized_exchanges()
+            batches = memory.batch_conversations_for_summary(unsummarized)
+            if not batches:
+                return
+
+            print(
+                f"[Memory] Summarizing {len(unsummarized)} older "
+                f"exchange rows in {len(batches)} batch(es)…"
+            )
+
+            if SPEAK_MEMORY_UPDATE:
+                try:
+                    self.speak_direct("One moment, Sir. Updating my memory.")
+                except Exception as e:
+                    print(f"[Memory] memory-update speak error: {e}")
+
+            for batch in batches:
+                try:
+                    conversation_text = "\n".join(
+                        f"{row['role'].upper()}: {row['content']}" for row in batch
+                    )
+                    summary_prompt = (
+                        "Below is a short excerpt from a conversation between an AI "
+                        "assistant named Jarvis and his user Nicholas. Write a 2-3 "
+                        "sentence factual summary of what was discussed or learned. "
+                        "Focus on facts, preferences, plans, or anything personally "
+                        "relevant to Nicholas. Write in third person. Do not include "
+                        "filler or commentary. Do not start with 'In this conversation' "
+                        "or 'The user'.\n\n"
+                        + conversation_text
+                    )
+
+                    # Silent non-streaming LLM call — no TTS, no history mutation.
+                    result = self._llm.create_chat_completion(
+                        messages=[
+                            {"role": "system", "content": "You are a concise summarizer. Reply with only the summary."},
+                            {"role": "user", "content": summary_prompt},
+                        ],
+                        max_tokens=160,
+                        temperature=0.3,
+                        top_p=0.9,
+                        stop=["<|eot_id|>"],
+                        stream=False,
+                    )
+                    summary_text = (
+                        result["choices"][0]["message"]["content"] or ""
+                    ).strip()
+                    summary_text = _clean(summary_text)
+
+                    if not summary_text:
+                        print("[Memory] Empty summary — skipping batch.")
+                        continue
+
+                    ids = [row["id"] for row in batch]
+                    timestamps = [row["timestamp"] for row in batch if row.get("timestamp")]
+                    date_from = min(timestamps) if timestamps else ""
+                    date_to = max(timestamps) if timestamps else ""
+
+                    memory.save_summary(
+                        summary_text=summary_text,
+                        conversation_ids=ids,
+                        date_from=date_from,
+                        date_to=date_to,
+                    )
+                    print(
+                        f"[Memory] Summarized batch of {len(batch)} exchanges: "
+                        f"{summary_text[:80]}{'…' if len(summary_text) > 80 else ''}"
+                    )
+                except Exception as e:
+                    print(f"[Memory] batch summarize error: {e}")
+                    continue
+
+            # Refresh the system prompt so new summaries are used immediately.
+            self._rebuild_system_prompt()
+            print("[Memory] Summarization complete.")
+        except Exception as e:
+            print(f"[Memory] Summarization error: {e}")
+        finally:
+            self._summarizing = False
+
     def _rebuild_system_prompt(self) -> None:
-        """Rebuild the system prompt from the base prompt + current memory facts.
-        Called at startup and whenever facts change mid-session."""
+        """Rebuild the system prompt from the base prompt + current memory facts
+        + rolling summaries of older conversations (Level 3).
+        Called at startup and whenever facts or summaries change mid-session."""
         prompt = self._base_prompt
         facts_str = memory.format_facts_for_prompt()
         if facts_str:
             prompt = prompt + "\n\n" + facts_str
+        summaries_str = memory.format_summaries_for_prompt()
+        if summaries_str:
+            prompt = prompt + "\n\n" + summaries_str
         prompt = prompt + " When the user asks you to remember something, confirm it naturally with a brief phrase like 'Got it, I will keep that in mind' or 'Noted.' Do not repeat the fact back verbatim."
         self.system_prompt = prompt
 
@@ -1386,6 +1485,16 @@ class VoiceAssistant:
                     continue
 
                 if not self._in_conversation:
+                    # Level 3: fire background summarization on wake-mode entry.
+                    # Flag is set at __init__ (startup) and in _end_conversation
+                    # (inactivity timeout + manual return-to-wake command).
+                    if self._needs_wake_summarization:
+                        self._needs_wake_summarization = False
+                        threading.Thread(
+                            target=self._summarize_old_exchanges,
+                            daemon=True,
+                        ).start()
+
                     # WAKE MODE: listen for wake word
                     detected = self._listen_for_wake_word()
                     if detected:

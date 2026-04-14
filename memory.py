@@ -10,6 +10,7 @@ Uses only Python's built-in sqlite3 — no new dependencies.
 
 import sqlite3
 import datetime
+import json as _json
 import re
 import time
 from pathlib import Path
@@ -85,6 +86,18 @@ class MemoryManager:
                     role TEXT,
                     content TEXT,
                     timestamp DATETIME
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS summaries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    summary_text TEXT,
+                    date_from DATETIME,
+                    date_to DATETIME,
+                    conversation_ids TEXT,
+                    created_at DATETIME
                 )
                 """
             )
@@ -425,3 +438,106 @@ class MemoryManager:
         except Exception as e:
             print(f"[Memory] detect_remember_command error: {e}")
             return None
+
+    # ── Level 3: Summarization ───────────────────────────────────────────────
+    def get_unsummarized_exchanges(self) -> list:
+        """Return conversation rows not yet covered by any summary and outside
+        the active 40-row (20-exchange) window."""
+        try:
+            # Collect every conversation_id already covered by a summary.
+            cur = self._conn.execute("SELECT conversation_ids FROM summaries")
+            covered = set()
+            for (ids_json,) in cur.fetchall():
+                if not ids_json:
+                    continue
+                try:
+                    ids = _json.loads(ids_json)
+                    for i in ids:
+                        covered.add(int(i))
+                except Exception:
+                    continue
+
+            # Determine the cutoff id: everything newer than this is part of
+            # the active window and should be skipped.
+            cur = self._conn.execute(
+                "SELECT id FROM conversations ORDER BY id DESC LIMIT 40"
+            )
+            active_ids = {row[0] for row in cur.fetchall()}
+
+            # Fetch every conversation row and filter in Python — simple and
+            # correct even when covered/active sets overlap strangely.
+            cur = self._conn.execute(
+                "SELECT id, role, content, timestamp FROM conversations ORDER BY id ASC"
+            )
+            out = []
+            for cid, role, content, ts in cur.fetchall():
+                if cid in covered:
+                    continue
+                if cid in active_ids:
+                    continue
+                out.append(
+                    {"id": cid, "role": role, "content": content, "timestamp": ts}
+                )
+            return out
+        except Exception as e:
+            print(f"[Memory] get_unsummarized_exchanges error: {e}")
+            return []
+
+    def save_summary(
+        self,
+        summary_text: str,
+        conversation_ids: list,
+        date_from: str,
+        date_to: str,
+    ) -> None:
+        try:
+            ids_json = _json.dumps(list(conversation_ids))
+            now = datetime.datetime.utcnow().isoformat()
+            self._conn.execute(
+                "INSERT INTO summaries (summary_text, date_from, date_to, conversation_ids, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (summary_text, date_from, date_to, ids_json, now),
+            )
+            self._conn.commit()
+        except Exception as e:
+            print(f"[Memory] save_summary error: {e}")
+
+    def get_recent_summaries(self, days: int = 30) -> list:
+        try:
+            cutoff = (
+                datetime.datetime.utcnow() - datetime.timedelta(days=days)
+            ).isoformat()
+            cur = self._conn.execute(
+                "SELECT summary_text FROM summaries WHERE created_at >= ? "
+                "ORDER BY created_at ASC",
+                (cutoff,),
+            )
+            return [row[0] for row in cur.fetchall() if row[0]]
+        except Exception as e:
+            print(f"[Memory] get_recent_summaries error: {e}")
+            return []
+
+    def format_summaries_for_prompt(self) -> str:
+        try:
+            summaries = self.get_recent_summaries()
+            if not summaries:
+                return ""
+            bullets = "\n".join(f"- {s}" for s in summaries)
+            return f"What I recall from older conversations:\n{bullets}"
+        except Exception as e:
+            print(f"[Memory] format_summaries_for_prompt error: {e}")
+            return ""
+
+    def batch_conversations_for_summary(
+        self, conversations: list, batch_size: int = 10
+    ) -> list:
+        try:
+            if not conversations:
+                return []
+            return [
+                conversations[i : i + batch_size]
+                for i in range(0, len(conversations), batch_size)
+            ]
+        except Exception as e:
+            print(f"[Memory] batch_conversations_for_summary error: {e}")
+            return []
