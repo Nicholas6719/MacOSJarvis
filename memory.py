@@ -101,6 +101,18 @@ class MemoryManager:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS meta_summaries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    summary_text TEXT,
+                    covers_from DATETIME,
+                    covers_to DATETIME,
+                    source_summary_ids TEXT,
+                    created_at DATETIME
+                )
+                """
+            )
             self._conn.commit()
         except Exception as e:
             print(f"[Memory] Init error: {e}")
@@ -541,3 +553,143 @@ class MemoryManager:
         except Exception as e:
             print(f"[Memory] batch_conversations_for_summary error: {e}")
             return []
+
+    # ── Level 3+: Cleanup of covered raw conversations ──────────────────────
+    def cleanup_summarized_exchanges(self) -> int:
+        """Delete conversation rows that are already covered by a summary AND
+        outside the most-recent 40-row active window. Never touches facts or
+        summaries tables. Never deletes anything not covered. Never deletes
+        anything inside the active window. Returns count of deleted rows."""
+        try:
+            # Build the set of IDs covered by any existing summary.
+            cur = self._conn.execute("SELECT conversation_ids FROM summaries")
+            covered = set()
+            for (ids_json,) in cur.fetchall():
+                if not ids_json:
+                    continue
+                try:
+                    ids = _json.loads(ids_json)
+                    for i in ids:
+                        covered.add(int(i))
+                except Exception:
+                    continue
+
+            if not covered:
+                return 0
+
+            # Lock the most recent 40 rows — the active window is untouchable.
+            cur = self._conn.execute(
+                "SELECT id FROM conversations ORDER BY id DESC LIMIT 40"
+            )
+            active_ids = {row[0] for row in cur.fetchall()}
+
+            # Deletable = covered AND NOT active.
+            deletable = [cid for cid in covered if cid not in active_ids]
+            if not deletable:
+                return 0
+
+            # Delete in chunks to keep the SQL parameter list sane.
+            deleted_total = 0
+            chunk = 500
+            for i in range(0, len(deletable), chunk):
+                piece = deletable[i : i + chunk]
+                placeholders = ",".join("?" * len(piece))
+                cur = self._conn.execute(
+                    f"DELETE FROM conversations WHERE id IN ({placeholders})",
+                    piece,
+                )
+                deleted_total += cur.rowcount if cur.rowcount and cur.rowcount > 0 else len(piece)
+            self._conn.commit()
+
+            if deleted_total > 0:
+                print(f"[Memory] Cleaned up {deleted_total} covered conversation rows.")
+            return deleted_total
+        except Exception as e:
+            print(f"[Memory] cleanup_summarized_exchanges error: {e}")
+            return 0
+
+    # ── Level 3+: Meta-summarization of old summaries ───────────────────────
+    def get_summaries_needing_meta(self, days: int = 30) -> list:
+        """Return summary rows older than `days` days whose id is NOT already
+        covered by any existing meta_summary's source_summary_ids."""
+        try:
+            # Collect already-covered summary IDs from existing meta summaries.
+            cur = self._conn.execute("SELECT source_summary_ids FROM meta_summaries")
+            covered = set()
+            for (ids_json,) in cur.fetchall():
+                if not ids_json:
+                    continue
+                try:
+                    for i in _json.loads(ids_json):
+                        covered.add(int(i))
+                except Exception:
+                    continue
+
+            cutoff = (
+                datetime.datetime.utcnow() - datetime.timedelta(days=days)
+            ).isoformat()
+            cur = self._conn.execute(
+                "SELECT id, summary_text, date_from, date_to "
+                "FROM summaries WHERE created_at < ? ORDER BY created_at ASC",
+                (cutoff,),
+            )
+            out = []
+            for sid, text, dfrom, dto in cur.fetchall():
+                if sid in covered:
+                    continue
+                out.append(
+                    {
+                        "id": sid,
+                        "summary_text": text or "",
+                        "date_from": dfrom or "",
+                        "date_to": dto or "",
+                    }
+                )
+            return out
+        except Exception as e:
+            print(f"[Memory] get_summaries_needing_meta error: {e}")
+            return []
+
+    def save_meta_summary(
+        self,
+        summary_text: str,
+        source_ids: list,
+        covers_from: str,
+        covers_to: str,
+    ) -> None:
+        try:
+            ids_json = _json.dumps(list(source_ids))
+            now = datetime.datetime.utcnow().isoformat()
+            self._conn.execute(
+                "INSERT INTO meta_summaries "
+                "(summary_text, covers_from, covers_to, source_summary_ids, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (summary_text, covers_from, covers_to, ids_json, now),
+            )
+            self._conn.commit()
+        except Exception as e:
+            print(f"[Memory] save_meta_summary error: {e}")
+
+    def get_latest_meta_summary(self):
+        try:
+            cur = self._conn.execute(
+                "SELECT summary_text FROM meta_summaries "
+                "ORDER BY created_at DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0]
+            return None
+        except Exception as e:
+            print(f"[Memory] get_latest_meta_summary error: {e}")
+            return None
+
+    def format_meta_summary_for_prompt(self) -> str:
+        try:
+            latest = self.get_latest_meta_summary()
+            if not latest:
+                return ""
+            return f"Long-range memory: {latest}"
+        except Exception as e:
+            print(f"[Memory] format_meta_summary_for_prompt error: {e}")
+            return ""

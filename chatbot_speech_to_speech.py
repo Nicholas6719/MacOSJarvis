@@ -1332,6 +1332,12 @@ class VoiceAssistant:
             # Refresh the system prompt so new summaries are used immediately.
             self._rebuild_system_prompt()
             print("[Memory] Summarization complete.")
+
+            # Level 3+: cleanup covered raw rows, then meta-summarize old
+            # summaries. Order matters — summaries first, then cleanup, then
+            # meta. All three are safe no-ops when there's nothing to do.
+            memory.cleanup_summarized_exchanges()
+            self._run_meta_summarization()
         except Exception as e:
             print(f"[Memory] Summarization error: {e}")
         finally:
@@ -1344,6 +1350,88 @@ class VoiceAssistant:
                 except Exception:
                     pass
 
+    def _run_meta_summarization(self) -> None:
+        """Level 3+: compress individual summaries older than 30 days into a
+        single rolling long-range memory paragraph. Silent — never speaks.
+        If a meta-summary already exists, merges new candidates into it."""
+        try:
+            candidates = memory.get_summaries_needing_meta()
+            if not candidates:
+                return
+
+            print(f"[Memory] Meta-summarizing {len(candidates)} old summaries.")
+
+            combined = "\n".join(
+                f"[{(s['date_from'] or '')[:10]} to {(s['date_to'] or '')[:10]}]: {s['summary_text']}"
+                for s in candidates
+            )
+
+            existing = memory.get_latest_meta_summary()
+            if existing:
+                meta_prompt = (
+                    "Below is an existing long-range memory paragraph about a person "
+                    "named Nicholas, followed by new summary entries to incorporate.\n\n"
+                    "EXISTING LONG-RANGE MEMORY:\n" + existing + "\n\n"
+                    "NEW SUMMARIES TO INCORPORATE:\n" + combined + "\n\n"
+                    "Rewrite the long-range memory as a single updated paragraph of "
+                    "3-5 sentences. Merge old and new information. Preserve all "
+                    "specific facts, preferences, names, and recurring themes. "
+                    "Write in third person. No filler. No bullet points. "
+                    "Do not start with 'Nicholas' as the first word."
+                )
+            else:
+                meta_prompt = (
+                    "Below are summary entries from conversations with a person "
+                    "named Nicholas. Compress them into a single paragraph of "
+                    "3-5 sentences capturing the most important facts, preferences, "
+                    "recurring themes, and anything personally relevant. "
+                    "Write in third person. No filler. No bullet points. "
+                    "Do not start with 'Nicholas' as the first word.\n\n"
+                    + combined
+                )
+
+            # Silent non-streaming LLM call — never TTS, never touches history.
+            result = self._llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": "You are a concise long-range memory compressor. Reply with only the paragraph."},
+                    {"role": "user", "content": meta_prompt},
+                ],
+                max_tokens=200,
+                temperature=0.3,
+                top_p=0.9,
+                stop=["<|eot_id|>"],
+                stream=False,
+            )
+            meta_text = (
+                result["choices"][0]["message"]["content"] or ""
+            ).strip()
+
+            if not meta_text:
+                print("[Memory] Meta-summarization returned empty result, skipping.")
+                return
+
+            meta_text = _clean(meta_text)
+            if not meta_text:
+                print("[Memory] Meta-summarization produced only filler, skipping.")
+                return
+
+            source_ids = [s["id"] for s in candidates]
+            dates_from = [s["date_from"] for s in candidates if s.get("date_from")]
+            dates_to = [s["date_to"] for s in candidates if s.get("date_to")]
+            covers_from = min(dates_from) if dates_from else ""
+            covers_to = max(dates_to) if dates_to else ""
+
+            memory.save_meta_summary(meta_text, source_ids, covers_from, covers_to)
+            print(
+                f"[Memory] Meta-summary saved. Covers "
+                f"{(covers_from or 'unknown')[:10]} to {(covers_to or 'unknown')[:10]}."
+            )
+
+            # Rebuild once more so the fresh meta-summary is in effect immediately.
+            self._rebuild_system_prompt()
+        except Exception as e:
+            print(f"[Memory] Meta-summarization error: {e}")
+
     def _rebuild_system_prompt(self) -> None:
         """Rebuild the system prompt from the base prompt + current memory facts
         + rolling summaries of older conversations (Level 3).
@@ -1352,6 +1440,11 @@ class VoiceAssistant:
         facts_str = memory.format_facts_for_prompt()
         if facts_str:
             prompt = prompt + "\n\n" + facts_str
+        # Long-range memory first (oldest context), then recent summaries.
+        # LLMs build understanding best when context flows oldest-to-newest.
+        meta_str = memory.format_meta_summary_for_prompt()
+        if meta_str:
+            prompt = prompt + "\n\n" + meta_str
         summaries_str = memory.format_summaries_for_prompt()
         if summaries_str:
             prompt = prompt + "\n\n" + summaries_str
