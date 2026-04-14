@@ -95,11 +95,14 @@ def _download(url: str, dest: Path) -> None:
 
 
 def _clean(text: str) -> str:
-    """Strip LLM artefacts: <think> tags, markdown symbols, excess newlines."""
+    """Strip LLM artefacts: <think> tags, markdown symbols, excess newlines.
+    Also force real sentence breaks where the LLM used a dash so TTS pauses."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"\*+", "", text)
     text = re.sub(r"#+\s*", "", text)
+    # Turn " - ", " -- ", " — " into ". " so TTS inserts a real pause.
+    text = re.sub(r"\s+[-—–]{1,2}\s+", ". ", text)
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
 
