@@ -187,7 +187,7 @@ class VoiceAssistant:
         self.vad = webrtcvad.Vad(3)
         self._audio_q: queue.Queue[bytes] = queue.Queue()
         self.history: list[dict] = []
-        prior_exchanges = memory.get_recent_exchanges(n=10)
+        prior_exchanges = memory.get_recent_exchanges(n=20)
         if prior_exchanges:
             self.history.extend(prior_exchanges)
             print(f"[Memory] Loaded {len(prior_exchanges)} messages from previous session.")
