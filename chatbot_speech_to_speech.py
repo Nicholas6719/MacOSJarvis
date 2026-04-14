@@ -32,6 +32,10 @@ from openwakeword.model import Model as WakeWordModel
 
 import ws_server
 
+from memory import MemoryManager
+memory = MemoryManager()
+memory.seed_initial_facts()
+
 
 class JarvisPauseRequest(Exception):
     """Raised when the user asks Jarvis to go to sleep via voice command."""
@@ -183,6 +187,10 @@ class VoiceAssistant:
         self.vad = webrtcvad.Vad(3)
         self._audio_q: queue.Queue[bytes] = queue.Queue()
         self.history: list[dict] = []
+        prior_exchanges = memory.get_recent_exchanges(n=10)
+        if prior_exchanges:
+            self.history.extend(prior_exchanges)
+            print(f"[Memory] Loaded {len(prior_exchanges)} messages from previous session.")
         self.system_prompt: str = self.cfg["llm"].get(
             "prompt_behavior",
             "You are Jarvis, a helpful and concise voice assistant. "
@@ -191,6 +199,10 @@ class VoiceAssistant:
             "If asked for your name, say your name is Jarvis. "
             "Keep answers brief and conversational. No bullet points or markdown.",
         )
+        facts_str = memory.format_facts_for_prompt()
+        if facts_str:
+            self.system_prompt = self.system_prompt + "\n\n" + facts_str
+        self.system_prompt = self.system_prompt + " When the user asks you to remember something, confirm it naturally with a brief phrase like 'Got it, I will keep that in mind' or 'Noted.' Do not repeat the fact back verbatim."
         self._stop_speak = threading.Event()
         self._tts_speaking = False
         self._cancel_timer = threading.Event()
@@ -1309,6 +1321,8 @@ class VoiceAssistant:
         sys.stdout.write(f"Jarvis: {response_text}\n")
         sys.stdout.flush()
 
+        memory.save_exchange(user_input, response_text)
+
         player.wait()
         llm_t.join()
         # Resume conversation timer after LLM response finishes speaking
@@ -1412,6 +1426,12 @@ class VoiceAssistant:
                 self._cancel_conversation_timer()
 
                 print(f"You: {user_input}")
+
+                remember_fact = memory.detect_remember_command(user_input)
+                if remember_fact:
+                    fact_key = "user_note_" + str(int(time.time()))
+                    memory.save_fact(fact_key, remember_fact)
+                    print(f"[Memory] Saved fact: {remember_fact}")
 
                 # Clipboard augmentation
                 augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
