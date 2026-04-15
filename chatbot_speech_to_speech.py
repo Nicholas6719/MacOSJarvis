@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import pyaudio
 import sounddevice as sd
 import webrtcvad
 from openwakeword.model import Model as WakeWordModel
@@ -249,9 +248,16 @@ class VoiceAssistant:
         self._conversation_timer: Optional[threading.Timer] = None
         self._return_to_wake = threading.Event()
         self._wake_model: Optional[WakeWordModel] = None
-        self._wake_audio = None
-        self._wake_stream = None
-        self._wake_stream_open = False
+        # Persistent audio stream shared between wake-word detection and
+        # command recording. Eliminates the ~300-500ms gap that used to
+        # exist when closing the pyaudio wake stream and opening a fresh
+        # sounddevice stream for record_audio — that gap was swallowing
+        # single-breath commands after the wake word fired.
+        self._persistent_stream: Optional[sd.RawInputStream] = None
+        # Buffer for accumulating audio samples until we have enough for
+        # the wake-word model (WAKE_CHUNK_SIZE = 1280 samples = 80ms).
+        # The persistent stream delivers 480-sample (30ms) frames.
+        self._wake_buf = np.array([], dtype=np.int16)
 
     # ── Loading ───────────────────────────────────────────────────────────────
 
@@ -359,18 +365,29 @@ class VoiceAssistant:
         Record a full user utterance.
         Uses adaptive silence: short commands cut off at 600 ms,
         longer speech (> 2.5 s) gets 950 ms — so you can finish long sentences.
+
+        Reads from the shared self._audio_q which is fed by the persistent
+        sd.RawInputStream started in _init_wake_word. There's no stream
+        open/close here — the stream has been running continuously since
+        startup, which means when the wake word fires, any audio the user
+        is speaking right now is ALREADY in the queue and available
+        immediately. This is what makes single-breath commands work.
         """
         while ws_server.is_muted():
             ws_server.set_state("idle")
             time.sleep(0.1)
 
-        # Short pause + drain so the mic doesn't pick up residual TTS audio.
-        # Skip the pause entirely on the first capture after wake-word fires
-        # — there's no TTS to echo and every millisecond matters for
-        # catching single-breath commands like "Hey Jarvis, tell me a joke".
+        # Drain + brief pause to let residual TTS audio clear from the
+        # mic buffer. CRITICAL: skip this on the first capture after
+        # wake-word fires — at that moment there's no TTS to echo, and
+        # any frames currently in the queue are the user's command
+        # (they just finished saying the wake phrase and are continuing
+        # with the actual request). Throwing them away is why every
+        # previous attempt missed single-breath commands.
         if not self._just_woke:
             time.sleep(0.2)
-        self._drain_q()
+            self._drain_q()
+
         ws_server.set_state("listening")
         print("🎤  Listening …", flush=True)
         buf        = b""
@@ -378,53 +395,47 @@ class VoiceAssistant:
         speech_ms  = 0
         speaking   = False
         # Rolling buffer of recent frames so the first syllable isn't clipped.
-        # 5 frames × 30 ms = 150 ms of pre-roll audio kept before VAD triggers.
         pre_roll: collections.deque[bytes] = collections.deque(maxlen=5)
 
-        def _cb(indata: np.ndarray, *_) -> None:
-            self._audio_q.put(bytes(indata))
-
-        with sd.RawInputStream(
-            samplerate=SAMPLE_RATE,
-            blocksize=FRAME_SIZE,
-            dtype="int16",
-            channels=1,
-            callback=_cb,
-        ):
-            while True:
-                if ws_server.is_muted():
-                    return b""
-                if self._tts_speaking:
-                    # Discard all incoming audio while Jarvis is speaking
-                    try:
-                        self._audio_q.get_nowait()
-                    except queue.Empty:
-                        time.sleep(0.01)
-                    speaking = False
-                    buf = b""
-                    continue
-                frame = self._audio_q.get()
-                if self.vad.is_speech(frame, SAMPLE_RATE):
-                    if not speaking:
-                        # Prepend buffered frames so the start of speech is preserved
-                        buf = b"".join(pre_roll)
-                    buf       += frame
-                    silence_ms = 0
-                    speaking   = True
-                    speech_ms += FRAME_MS
-                elif speaking:
-                    buf        += frame
-                    silence_ms += FRAME_MS
-                    cutoff = (
-                        SILENCE_CUTOFF_LONG_MS
-                        if speech_ms >= LONG_SPEECH_THRESHOLD_MS
-                        else SILENCE_CUTOFF_SHORT_MS
-                    )
-                    if silence_ms > cutoff:
-                        break
-                else:
-                    # Not speaking yet — keep recent frames for pre-roll
-                    pre_roll.append(frame)
+        # No `with sd.RawInputStream(...)` — the persistent stream is
+        # already running. Read directly from the shared queue.
+        while True:
+            if ws_server.is_muted():
+                return b""
+            if self._tts_speaking:
+                # Discard all incoming audio while Jarvis is speaking
+                try:
+                    self._audio_q.get_nowait()
+                except queue.Empty:
+                    time.sleep(0.01)
+                speaking = False
+                buf = b""
+                continue
+            try:
+                frame = self._audio_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if self.vad.is_speech(frame, SAMPLE_RATE):
+                if not speaking:
+                    # Prepend buffered frames so the start of speech is preserved
+                    buf = b"".join(pre_roll)
+                buf       += frame
+                silence_ms = 0
+                speaking   = True
+                speech_ms += FRAME_MS
+            elif speaking:
+                buf        += frame
+                silence_ms += FRAME_MS
+                cutoff = (
+                    SILENCE_CUTOFF_LONG_MS
+                    if speech_ms >= LONG_SPEECH_THRESHOLD_MS
+                    else SILENCE_CUTOFF_SHORT_MS
+                )
+                if silence_ms > cutoff:
+                    break
+            else:
+                # Not speaking yet — keep recent frames for pre-roll
+                pre_roll.append(frame)
         # Check RMS energy — ignore if it's just background noise
         audio_np = np.frombuffer(buf, dtype=np.int16)
         if len(audio_np) == 0:
@@ -683,71 +694,94 @@ class VoiceAssistant:
     # ── Wake word ─────────────────────────────────────────────────────────────
 
     def _init_wake_word(self) -> None:
+        """Load the openwakeword model AND start the persistent audio stream.
+
+        The persistent stream feeds self._audio_q continuously from here on.
+        Both wake-word detection and command recording read from the same
+        queue, so there's no stream close/reopen between modes and no gap
+        where single-breath commands can get lost."""
         print("[WAKE] Loading hey_jarvis model...", flush=True)
         self._wake_model = WakeWordModel(
             wakeword_models=[WAKE_WORD_MODEL],
             inference_framework='onnx'
         )
-        self._wake_audio = pyaudio.PyAudio()
+        self._start_persistent_stream()
         print("[WAKE] Ready — listening for 'Hey Jarvis'", flush=True)
 
-    def _open_wake_stream(self):
-        return self._wake_audio.open(
-            rate=16000,
+    def _start_persistent_stream(self) -> None:
+        """Create and start the always-on sd.RawInputStream. Idempotent:
+        calling it when the stream is already running is a no-op."""
+        if self._persistent_stream is not None:
+            return
+
+        def _cb(indata, frames, time_info, status):
+            # Push raw bytes to the shared queue. Both the wake-word loop
+            # and record_audio consume from this queue.
+            self._audio_q.put(bytes(indata))
+
+        self._persistent_stream = sd.RawInputStream(
+            samplerate=SAMPLE_RATE,
+            blocksize=FRAME_SIZE,
+            dtype="int16",
             channels=1,
-            format=pyaudio.paInt16,
-            input=True,
-            frames_per_buffer=WAKE_CHUNK_SIZE
+            callback=_cb,
         )
+        self._persistent_stream.start()
+
+    def _stop_persistent_stream(self) -> None:
+        if self._persistent_stream is None:
+            return
+        try:
+            self._persistent_stream.stop()
+            self._persistent_stream.close()
+        except Exception:
+            pass
+        self._persistent_stream = None
 
     def _listen_for_wake_word(self) -> bool:
-        if not self._wake_stream_open:
-            try:
-                self._wake_stream = self._open_wake_stream()
-                self._wake_stream_open = True
-            except Exception as e:
-                print(f"[WAKE] Stream error: {e}", flush=True)
-                time.sleep(0.1)
-                return False
+        """Consume from the shared queue, accumulate samples, feed openwakeword.
+        Returns True the instant the model fires, leaving any unconsumed
+        queue frames (the tail of the user's command) available for
+        record_audio to pick up immediately."""
+        # Pull one frame (30ms of audio). Short timeout so we don't block
+        # the main loop if the stream stalls for any reason.
         try:
-            audio_data = self._wake_stream.read(
-                WAKE_CHUNK_SIZE, exception_on_overflow=False
-            )
-            audio = np.frombuffer(audio_data, dtype=np.int16)
-            prediction = self._wake_model.predict(audio)
-            score = prediction.get(WAKE_WORD_MODEL, 0)
-            if score >= WAKE_WORD_THRESHOLD:
-                self._close_wake_stream()
-                # Reset model state to clear stale predictions
-                try:
-                    self._wake_model.reset()
-                except Exception:
-                    pass
-                return True
-            return False
-        except Exception:
-            self._close_wake_stream()
-            time.sleep(0.01)
+            frame = self._audio_q.get(timeout=0.1)
+        except queue.Empty:
             return False
 
-    def _close_wake_stream(self) -> None:
+        samples = np.frombuffer(frame, dtype=np.int16)
+        self._wake_buf = np.concatenate((self._wake_buf, samples))
+
+        # Not enough for a prediction yet — wait for more frames.
+        if len(self._wake_buf) < WAKE_CHUNK_SIZE:
+            return False
+
+        # Run prediction on the oldest 1280 samples, keep the remainder
+        # for next time (streaming-style).
+        chunk = self._wake_buf[:WAKE_CHUNK_SIZE]
+        self._wake_buf = self._wake_buf[WAKE_CHUNK_SIZE:]
+
         try:
-            if self._wake_stream is not None:
-                self._wake_stream.stop_stream()
-                self._wake_stream.close()
-                self._wake_stream = None
-        except Exception:
-            pass
-        self._wake_stream_open = False
+            prediction = self._wake_model.predict(chunk)
+        except Exception as e:
+            print(f"[WAKE] predict error: {e}", flush=True)
+            return False
+
+        score = prediction.get(WAKE_WORD_MODEL, 0)
+        if score >= WAKE_WORD_THRESHOLD:
+            try:
+                self._wake_model.reset()
+            except Exception:
+                pass
+            # Clear the wake buffer so the next wake cycle starts fresh.
+            self._wake_buf = np.array([], dtype=np.int16)
+            return True
+        return False
 
     def _cleanup_wake_word(self) -> None:
-        self._close_wake_stream()
-        try:
-            if self._wake_audio is not None:
-                self._wake_audio.terminate()
-                self._wake_audio = None
-        except Exception:
-            pass
+        """Shut down the persistent stream on session exit."""
+        self._stop_persistent_stream()
 
     # ── Conversation timer ───────────────────────────────────────────────────
 
@@ -770,12 +804,17 @@ class VoiceAssistant:
         self._cancel_conversation_timer()
         self._return_to_wake.set()
         ws_server.set_state("wake")
-        self._close_wake_stream()
+        # No stream close here — the persistent stream stays running
+        # across wake-mode transitions so the next "Hey Jarvis" has
+        # zero audio gap.
         self._needs_wake_summarization = True  # Level 3: re-check on wake entry
         print("\n[WAKE] Returning to wake mode", flush=True)
         # Drain audio and wait for residual TTS audio to clear
         time.sleep(2.0)
         self._drain_q()
+        # Reset the wake buffer — any partial samples from the previous
+        # conversation are no longer relevant for the next wake detection.
+        self._wake_buf = np.array([], dtype=np.int16)
 
     # ── System commands ───────────────────────────────────────────────────────
 
@@ -1697,10 +1736,13 @@ class VoiceAssistant:
             )
             return
 
-        # Route reminders through the reminder path if the LLM flagged it
-        if bool(data_json.get("is_reminder")):
-            self._cal_create_reminder(user_input, pre_extracted=data_json)
-            return
+        # DO NOT trust the LLM's `is_reminder` flag here. Our regex-based
+        # intent detection already decided this is a calendar event (it
+        # matched shift-style phrases with an explicit time range, or a
+        # calendar/event/meeting keyword). Letting the LLM flip it to a
+        # reminder after the fact was exactly the bug where "I'm working
+        # tomorrow from 7 to 5" created a Reminder instead of a Calendar
+        # event. The LLM doesn't know the intent routing already happened.
 
         # Sanitize LLM output: sometimes the model returns the STRING "null"
         # instead of real JSON null, which would then be used as a literal
