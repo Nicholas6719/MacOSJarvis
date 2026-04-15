@@ -46,11 +46,13 @@ memory.seed_initial_facts()
 SPEAK_CALENDAR_ACK = True
 
 # When True, use the LLM to generate natural-language confirmations after
-# successful calendar writes ("Done, Sir. I've scheduled..."). When False,
-# use a fast template — saves 4-6 seconds per calendar command at the cost
-# of a slightly more scripted response. Default False because the LLM
-# confirmation was the biggest source of latency during Nicholas's testing.
-NATURAL_CALENDAR_CONFIRMATIONS = False
+# successful calendar writes ("Done, Sir. I've scheduled your shift on
+# Saturday — let me know if anything needs adjusting."). When False, use a
+# fast hard-coded template that saves 4-6 seconds per calendar command at
+# the cost of feeling more scripted. The template path is kept as an
+# emergency fallback and as a latency escape hatch — flip to False if the
+# LLM path ever feels too slow again.
+NATURAL_CALENDAR_CONFIRMATIONS = True
 
 
 class JarvisPauseRequest(Exception):
@@ -1908,7 +1910,6 @@ class VoiceAssistant:
             "end_datetime": end_dt,
             "location": location,
             "notes": notes,
-            "raw_text": user_input,
         }
 
         # Memory-backed location logic. Only ask when the utterance
@@ -2007,10 +2008,8 @@ class VoiceAssistant:
             )
         self._safe_speak(text)
 
-    def _cal_create_reminder(
-        self, user_input: str, pre_extracted: Optional[dict] = None
-    ) -> None:
-        data_json = pre_extracted or self._extract_event_json(user_input)
+    def _cal_create_reminder(self, user_input: str) -> None:
+        data_json = self._extract_event_json(user_input)
         if not data_json:
             self._safe_speak(
                 "I didn't quite catch that, Sir. Could you say it again?"
