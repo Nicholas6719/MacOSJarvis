@@ -1339,6 +1339,29 @@ class VoiceAssistant:
            re.search(r"\bnew\s+(?:calendar\s+)?event\b", t):
             return "create_event"
 
+        # Shift-style create_event triggers: "I'm working tomorrow from 7 to 5",
+        # "I have a shift Monday 9 to 5", "I'll be working at 8am tomorrow".
+        # These require BOTH a working/shift phrase AND an unambiguous time
+        # signal (explicit digits in a from/at/range/am-pm pattern). The time
+        # requirement is what keeps casual chat like "I'm working on a
+        # project" or "I'm working from home today" from matching — there
+        # are no digits in either.
+        _TIME_SIGNAL = (
+            r"\b(?:from\s+\d|at\s+\d|\d{1,2}\s*(?:to|until|-|till)\s*\d|"
+            r"\d{1,2}\s*(?:am|pm|a\.m|p\.m|o'?clock))"
+        )
+        _SHIFT_PHRASE = (
+            r"\b(?:i(?:'?m|\s+am)\s+working|"       # "i'm working" / "i am working"
+            r"i(?:'?ll|\s+will)\s+be\s+working|"   # "i'll be working" / "i will be working"
+            r"i\s+work\b|"                           # "i work" (bare; time req filters it)
+            r"i\s+have\s+(?:a\s+)?shift|"
+            r"i(?:'?ve|\s+have)\s+got\s+(?:a\s+)?shift|"
+            r"i(?:'?m|\s+am)\s+on\s+shift|"
+            r"working\s+(?:a\s+)?shift)\b"
+        )
+        if re.search(_SHIFT_PHRASE, t) and re.search(_TIME_SIGNAL, t):
+            return "create_event"
+
         return None
 
     # ── LLM helpers (both silent, non-streaming — no history mutation) ──────
@@ -2297,20 +2320,22 @@ class VoiceAssistant:
                     # WAKE MODE: listen for wake word
                     detected = self._listen_for_wake_word()
                     if detected:
-                        # Longer drain + sleep after wake-word fires. Fixes
-                        # the "Jarvis transcribes my wake phrase as the
-                        # first command" bug — the mic was catching the
-                        # tail of the user's own 'Hey Jarvis' and sending
-                        # it straight to STT. A full second of silence
-                        # between wake detection and first mic capture
-                        # clears the user's voice and any wake-word echo.
-                        time.sleep(1.0)
+                        # Short drain + short sleep after wake-word fires.
+                        # A long delay here would SWALLOW the user's command
+                        # in the single-breath case ("Hey Jarvis, tell me a
+                        # joke"): the mic would open after the sentence is
+                        # already finished. Keep the delay minimal and let
+                        # the echo-stripping logic below handle any
+                        # "hey jarvis" tail that slips into the transcript.
+                        time.sleep(0.2)
                         self._drain_q()
                         self._in_conversation = True
                         self._return_to_wake.clear()
                         # Mark this turn as the first post-wake utterance
-                        # so the run loop can discard an echo of the
-                        # wake phrase if it slips through anyway.
+                        # so the run loop can either strip a "hey jarvis"
+                        # prefix from the first transcription or discard
+                        # the transcript entirely if it's just the wake
+                        # phrase echo.
                         self._just_woke = True
                         self._start_conversation_timer()
                         ws_server.set_state("listening")
