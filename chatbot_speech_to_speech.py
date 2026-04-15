@@ -1419,10 +1419,16 @@ class VoiceAssistant:
            re.search(r"\banything\s+on\s+(?:my\s+)?calendar\s+today\b", t):
             return "read_today"
 
-        # Read upcoming (rest of the week)
+        # Read upcoming (rest of the week). These patterns deliberately
+        # REQUIRE "this week" or "the week" (not bare "week") so the
+        # false positive "calendar week starts on monday" doesn't fire.
+        # All of them tolerate an optional "for" between calendar/schedule
+        # and the week phrase — Nicholas said "what's on my calendar FOR
+        # this week?" and the previous regex didn't allow that "for".
         if re.search(r"\bwhat(?:'?s|\s+is)\s+coming\s+up\s+on\s+(?:my\s+)?(?:calendar|schedule)\b", t) or \
-           re.search(r"\bwhat(?:'?s|\s+is)\s+on\s+my\s+calendar\s+(?:this\s+)?week\b", t) or \
-           re.search(r"\b(?:my\s+)?schedule\s+(?:for\s+)?(?:this\s+)?week\b", t) or \
+           re.search(r"\b(?:my\s+)?calendar\s+(?:for\s+)?(?:this|the)\s+week\b", t) or \
+           re.search(r"\b(?:my\s+)?schedule\s+(?:for\s+)?(?:this|the)\s+week\b", t) or \
+           re.search(r"\bwhat\s+do\s+i\s+have\s+(?:for\s+)?(?:this|the)\s+week\b", t) or \
            re.search(r"\bwhat(?:'?s|\s+is)\s+on\s+(?:my\s+)?agenda\b", t):
             return "read_upcoming"
 
