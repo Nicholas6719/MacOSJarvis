@@ -45,6 +45,13 @@ memory.seed_initial_facts()
 # Flip this to False if the ack feels tedious — no other change needed.
 SPEAK_CALENDAR_ACK = True
 
+# When True, use the LLM to generate natural-language confirmations after
+# successful calendar writes ("Done, Sir. I've scheduled..."). When False,
+# use a fast template — saves 4-6 seconds per calendar command at the cost
+# of a slightly more scripted response. Default False because the LLM
+# confirmation was the biggest source of latency during Nicholas's testing.
+NATURAL_CALENDAR_CONFIRMATIONS = False
+
 
 class JarvisPauseRequest(Exception):
     """Raised when the user asks Jarvis to go to sleep via voice command."""
@@ -258,6 +265,18 @@ class VoiceAssistant:
         # the wake-word model (WAKE_CHUNK_SIZE = 1280 samples = 80ms).
         # The persistent stream delivers 480-sample (30ms) frames.
         self._wake_buf = np.array([], dtype=np.int16)
+        # Rolling buffer of the most recent ~2 seconds of raw audio frames
+        # (at 30ms each → 67 frames). Maintained while the wake model is
+        # still listening. When wake fires, this buffer contains the user's
+        # audio from BEFORE wake detection — crucial for single-breath
+        # commands like "Hey Jarvis, tell me a joke" where the wake model
+        # needs about a second to confidently fire, and by then the user
+        # has already said most of the command. record_audio replays these
+        # frames through its VAD/buffer logic so the full utterance is
+        # captured, not just what arrived after wake fire.
+        self._pre_wake_buf: collections.deque[bytes] = collections.deque(maxlen=67)
+        # Stashed at wake-fire time, consumed by the next record_audio call.
+        self._pending_pre_wake_audio: bytes = b""
 
     # ── Loading ───────────────────────────────────────────────────────────────
 
@@ -397,24 +416,51 @@ class VoiceAssistant:
         # Rolling buffer of recent frames so the first syllable isn't clipped.
         pre_roll: collections.deque[bytes] = collections.deque(maxlen=5)
 
+        # Priming frames from the pre-wake rolling buffer. When the wake
+        # word fires, _listen_for_wake_word stashes the last ~2 seconds of
+        # audio in self._pending_pre_wake_audio. We replay them through
+        # the same VAD/buffer logic so the full utterance gets captured —
+        # this is the ONLY way single-breath commands like "Hey Jarvis,
+        # tell me a joke" work, because by the time the wake model fires
+        # the user has already spoken most of the command.
+        priming_frames: list = []
+        if self._pending_pre_wake_audio:
+            raw = self._pending_pre_wake_audio
+            self._pending_pre_wake_audio = b""
+            bytes_per_frame = FRAME_SIZE * 2  # int16 = 2 bytes per sample
+            for i in range(0, len(raw) - bytes_per_frame + 1, bytes_per_frame):
+                priming_frames.append(raw[i:i + bytes_per_frame])
+        processing_priming = bool(priming_frames)
+
         # No `with sd.RawInputStream(...)` — the persistent stream is
         # already running. Read directly from the shared queue.
         while True:
-            if ws_server.is_muted():
-                return b""
-            if self._tts_speaking:
-                # Discard all incoming audio while Jarvis is speaking
+            # Pull the next frame: priming first, then the live queue.
+            if priming_frames:
+                frame = priming_frames.pop(0)
+            else:
+                if processing_priming:
+                    # Transition from priming to live audio. Don't reset
+                    # silence_ms — if the priming buffer ended with silence
+                    # after a short command, we want that silence to count
+                    # toward the cutoff.
+                    processing_priming = False
+                if ws_server.is_muted():
+                    return b""
+                if self._tts_speaking:
+                    # Discard all incoming audio while Jarvis is speaking
+                    try:
+                        self._audio_q.get_nowait()
+                    except queue.Empty:
+                        time.sleep(0.01)
+                    speaking = False
+                    buf = b""
+                    continue
                 try:
-                    self._audio_q.get_nowait()
+                    frame = self._audio_q.get(timeout=1.0)
                 except queue.Empty:
-                    time.sleep(0.01)
-                speaking = False
-                buf = b""
-                continue
-            try:
-                frame = self._audio_q.get(timeout=1.0)
-            except queue.Empty:
-                continue
+                    continue
+
             if self.vad.is_speech(frame, SAMPLE_RATE):
                 if not speaking:
                     # Prepend buffered frames so the start of speech is preserved
@@ -426,13 +472,18 @@ class VoiceAssistant:
             elif speaking:
                 buf        += frame
                 silence_ms += FRAME_MS
-                cutoff = (
-                    SILENCE_CUTOFF_LONG_MS
-                    if speech_ms >= LONG_SPEECH_THRESHOLD_MS
-                    else SILENCE_CUTOFF_SHORT_MS
-                )
-                if silence_ms > cutoff:
-                    break
+                # Don't break out while still processing priming frames —
+                # the "silence" might just be a pause between the wake
+                # phrase and the command in the original utterance. Only
+                # check the cutoff once we're reading live audio.
+                if not processing_priming:
+                    cutoff = (
+                        SILENCE_CUTOFF_LONG_MS
+                        if speech_ms >= LONG_SPEECH_THRESHOLD_MS
+                        else SILENCE_CUTOFF_SHORT_MS
+                    )
+                    if silence_ms > cutoff:
+                        break
             else:
                 # Not speaking yet — keep recent frames for pre-roll
                 pre_roll.append(frame)
@@ -740,15 +791,20 @@ class VoiceAssistant:
 
     def _listen_for_wake_word(self) -> bool:
         """Consume from the shared queue, accumulate samples, feed openwakeword.
-        Returns True the instant the model fires, leaving any unconsumed
-        queue frames (the tail of the user's command) available for
-        record_audio to pick up immediately."""
+        Returns True the instant the model fires, and stashes the last ~2
+        seconds of audio in self._pending_pre_wake_audio so record_audio can
+        replay it — that's how we capture single-breath commands where the
+        wake model fired halfway through the user's sentence."""
         # Pull one frame (30ms of audio). Short timeout so we don't block
         # the main loop if the stream stalls for any reason.
         try:
             frame = self._audio_q.get(timeout=0.1)
         except queue.Empty:
             return False
+
+        # Keep a rolling copy in the pre-wake buffer (2-second ring). deque
+        # with maxlen automatically drops the oldest frame when full.
+        self._pre_wake_buf.append(frame)
 
         samples = np.frombuffer(frame, dtype=np.int16)
         self._wake_buf = np.concatenate((self._wake_buf, samples))
@@ -774,8 +830,12 @@ class VoiceAssistant:
                 self._wake_model.reset()
             except Exception:
                 pass
-            # Clear the wake buffer so the next wake cycle starts fresh.
+            # Clear the wake sample accumulator.
             self._wake_buf = np.array([], dtype=np.int16)
+            # Stash the pre-wake rolling buffer for record_audio to replay.
+            # This is the crucial step for single-breath command capture.
+            self._pending_pre_wake_audio = b"".join(self._pre_wake_buf)
+            self._pre_wake_buf.clear()
             return True
         return False
 
@@ -812,9 +872,12 @@ class VoiceAssistant:
         # Drain audio and wait for residual TTS audio to clear
         time.sleep(2.0)
         self._drain_q()
-        # Reset the wake buffer — any partial samples from the previous
-        # conversation are no longer relevant for the next wake detection.
+        # Reset the wake buffers — any partial samples or rolling-buffer
+        # audio from the previous conversation are no longer relevant
+        # for the next wake detection.
         self._wake_buf = np.array([], dtype=np.int16)
+        self._pre_wake_buf.clear()
+        self._pending_pre_wake_audio = b""
 
     # ── System commands ───────────────────────────────────────────────────────
 
@@ -1787,26 +1850,42 @@ class VoiceAssistant:
             else:
                 title = "Event"
 
-        # Date correction. If the LLM returned "today" or today's ISO date
-        # but the user's utterance contains an explicit weekday name, prefer
-        # the weekday — this was the "I'm working Saturday" → today bug.
-        _today_iso = datetime.date.today().isoformat()
-        _date_str = str(date_field).lower().strip()
-        if _date_str in ("today", "now", _today_iso):
-            _weekday_match = re.search(
-                r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-                user_input.lower(),
-            )
-            if _weekday_match and not re.search(
-                r"\b(?:today|right\s+now|this\s+morning|this\s+afternoon|this\s+evening|tonight)\b",
-                user_input.lower(),
-            ):
-                new_date = _weekday_match.group(1)
+        # Date correction. The user's explicit weekday ALWAYS wins over
+        # whatever the LLM extracted — STT transcribes weekday names
+        # reliably (they're short and distinctive) and the LLM sometimes
+        # hallucinates a different day entirely. This fixes BOTH the
+        # "LLM said today instead of Saturday" bug AND the "LLM said
+        # Friday instead of Saturday" bug.
+        _weekday_match = re.search(
+            r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            user_input.lower(),
+        )
+        _has_today_phrase = bool(re.search(
+            r"\b(?:today|right\s+now|this\s+morning|this\s+afternoon|"
+            r"this\s+evening|tonight)\b",
+            user_input.lower(),
+        ))
+        if _weekday_match and not _has_today_phrase:
+            user_weekday = _weekday_match.group(1)
+            llm_date_lower = str(date_field).lower().strip()
+            # The LLM's extraction might already match in two ways: the
+            # weekday name appears in the string, OR the extracted ISO
+            # date falls on the user's stated weekday.
+            llm_already_matches = user_weekday in llm_date_lower
+            if not llm_already_matches:
+                try:
+                    _llm_dt = datetime.date.fromisoformat(llm_date_lower)
+                    if _llm_dt.strftime("%A").lower() == user_weekday:
+                        llm_already_matches = True
+                except ValueError:
+                    pass
+            if not llm_already_matches:
                 print(
-                    f"[Calendar] LLM returned {date_field!r} but user said "
-                    f"'{new_date}' — overriding date to {new_date!r}"
+                    f"[Calendar] User said {user_weekday!r} but LLM "
+                    f"extracted {date_field!r} — overriding to "
+                    f"{user_weekday!r}"
                 )
-                date_field = new_date
+                date_field = user_weekday
 
         resolved_date = self._resolve_relative_date(str(date_field))
         st = self._parse_time(start_time) or (9, 0)
@@ -1882,31 +1961,51 @@ class VoiceAssistant:
             )
             return
 
-        when = start_dt.strftime("%A %B %-d at %-I:%M %p")
+        # Build the confirmation. Template path is 4-6 seconds faster than
+        # the LLM path because it skips the generation step entirely —
+        # template text goes straight to TTS. See NATURAL_CALENDAR_CONFIRMATIONS
+        # at the top of the file to switch back to the LLM path.
+        when = start_dt.strftime("%A, %B %-d at %-I:%M %p")
         end_str = end_dt.strftime("%-I:%M %p")
-        loc_str = f" at {data['location']}" if data.get("location") else ""
-        end_clause = (
-            f" The end time was assumed as a 1-hour default ({end_str})."
-            if assumed_end else f" It ends at {end_str}."
-        )
-        action_desc = (
-            f"Created an event titled '{data['title']}' on {when}{loc_str} "
-            f"in the {data['calendar']} calendar.{end_clause}"
-        )
-        confirm_prompt = (
-            "Confirm this calendar action naturally and conversationally — "
-            "not scripted, not robotic. If an end time was assumed as a "
-            "1-hour default, mention it briefly and offer to change it. "
-            f"Action: {action_desc} "
-            "Keep it to two to three sentences max."
-        )
-        text = self._llm_silent(self._JARVIS_CAL_SYSTEM, confirm_prompt, max_tokens=160)
-        if text:
-            self._safe_speak(text)
+        loc_phrase = f" at {data['location']}" if data.get("location") else ""
+
+        if NATURAL_CALENDAR_CONFIRMATIONS:
+            end_clause = (
+                f" The end time was assumed as a 1-hour default ({end_str})."
+                if assumed_end else f" It ends at {end_str}."
+            )
+            action_desc = (
+                f"Created an event titled '{data['title']}' on {when}{loc_phrase} "
+                f"in the {data['calendar']} calendar.{end_clause}"
+            )
+            confirm_prompt = (
+                "Confirm this calendar action naturally and conversationally — "
+                "not scripted, not robotic. If an end time was assumed as a "
+                "1-hour default, mention it briefly and offer to change it. "
+                f"Action: {action_desc} "
+                "Keep it to two to three sentences max."
+            )
+            text = self._llm_silent(
+                self._JARVIS_CAL_SYSTEM, confirm_prompt, max_tokens=160
+            )
+            if text:
+                self._safe_speak(text)
+                return
+            # LLM failed — fall through to the template.
+
+        # Fast template path.
+        if assumed_end:
+            text = (
+                f"Done, Sir. I've added {data['title']} on {when}{loc_phrase} "
+                f"to your {data['calendar']} calendar. I assumed a one-hour "
+                f"duration ending at {end_str} — let me know if you'd like to change it."
+            )
         else:
-            # LLM failed — speak a plain confirmation so the user still
-            # knows it worked.
-            self._safe_speak(f"Done, Sir. I added {data['title']} to your calendar.")
+            text = (
+                f"Done, Sir. Your {data['title']} is scheduled for {when}"
+                f"{loc_phrase}, ending at {end_str}, on your {data['calendar']} calendar."
+            )
+        self._safe_speak(text)
 
     def _cal_create_reminder(
         self, user_input: str, pre_extracted: Optional[dict] = None
@@ -1945,22 +2044,32 @@ class VoiceAssistant:
             )
             return
 
+        if NATURAL_CALENDAR_CONFIRMATIONS:
+            if due_dt:
+                when = due_dt.strftime("%A, %B %-d at %-I:%M %p")
+                action_desc = f"Created a reminder '{title}' due {when}."
+            else:
+                action_desc = f"Created a reminder '{title}' with no specific due date."
+            confirm_prompt = (
+                "Confirm this reminder action naturally and conversationally — "
+                "not scripted, not robotic. "
+                f"Action: {action_desc} "
+                "Keep it to one to two sentences max."
+            )
+            text = self._llm_silent(
+                self._JARVIS_CAL_SYSTEM, confirm_prompt, max_tokens=140
+            )
+            if text:
+                self._safe_speak(text)
+                return
+
+        # Fast template path.
         if due_dt:
-            when = due_dt.strftime("%A %B %-d at %-I:%M %p")
-            action_desc = f"Created a reminder '{title}' due {when}."
+            when = due_dt.strftime("%A, %B %-d at %-I:%M %p")
+            text = f"Done, Sir. Reminder set: {title}, due {when}."
         else:
-            action_desc = f"Created a reminder '{title}' with no specific due date."
-        confirm_prompt = (
-            "Confirm this reminder action naturally and conversationally — "
-            "not scripted, not robotic. "
-            f"Action: {action_desc} "
-            "Keep it to one to two sentences max."
-        )
-        text = self._llm_silent(self._JARVIS_CAL_SYSTEM, confirm_prompt, max_tokens=140)
-        if text:
-            self._safe_speak(text)
-        else:
-            self._safe_speak(f"Done, Sir. I added '{title}' to your reminders.")
+            text = f"Done, Sir. I've added a reminder to {title}."
+        self._safe_speak(text)
 
     # ── Pending clarification resume ────────────────────────────────────────
 
