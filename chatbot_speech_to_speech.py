@@ -364,8 +364,12 @@ class VoiceAssistant:
             ws_server.set_state("idle")
             time.sleep(0.1)
 
-        # Short pause + drain so the mic doesn't pick up residual TTS audio
-        time.sleep(0.2)
+        # Short pause + drain so the mic doesn't pick up residual TTS audio.
+        # Skip the pause entirely on the first capture after wake-word fires
+        # — there's no TTS to echo and every millisecond matters for
+        # catching single-breath commands like "Hey Jarvis, tell me a joke".
+        if not self._just_woke:
+            time.sleep(0.2)
         self._drain_q()
         ws_server.set_state("listening")
         print("🎤  Listening …", flush=True)
@@ -1394,14 +1398,32 @@ class VoiceAssistant:
     def _extract_event_json(self, utterance: str) -> Optional[dict]:
         """Use the LLM to pull structured event fields from a free-form
         utterance. Returns a dict or None if extraction fails."""
-        today = datetime.date.today().isoformat()
+        today_date = datetime.date.today()
+        today_iso = today_date.isoformat()
+        today_name = today_date.strftime("%A")
         prompt = (
             "Extract calendar event details from this request. Respond in "
-            "JSON only — no explanation, no markdown. Fields: title (string), "
-            "date (YYYY-MM-DD or relative like today/tomorrow/next Monday), "
-            "start_time (HH:MM 24hr), end_time (HH:MM 24hr or null), location "
-            "(string or null), notes (string or null), is_reminder (true/false)."
-            f" Today is {today}. User said: '{utterance}'"
+            "JSON only — no explanation, no markdown. Use JSON null (the "
+            "bare keyword, not the string \"null\") for any field that "
+            "isn't specified.\n"
+            "\n"
+            "Fields:\n"
+            "- title: a short, descriptive event name. For a work shift use "
+            '"Work". For a meeting use "Meeting" or similar. NEVER use '
+            '"Jarvis" as a title — that\'s my name, not the event. Never '
+            "include day names (Monday, Saturday, etc.) in the title.\n"
+            "- date: YYYY-MM-DD, or the word today/tomorrow/yesterday, or "
+            "a weekday name (Monday, Tuesday, Wednesday, Thursday, Friday, "
+            "Saturday, Sunday). If the user explicitly names a weekday, "
+            'USE THAT WEEKDAY — do NOT substitute "today".\n'
+            "- start_time: HH:MM in 24-hour format\n"
+            "- end_time: HH:MM in 24-hour format, or null\n"
+            "- location: string, or null\n"
+            "- notes: string, or null\n"
+            "- is_reminder: true if this is a reminder, false if a calendar event\n"
+            "\n"
+            f"Today is {today_iso} ({today_name}). "
+            f"User said: '{utterance}'"
         )
         raw = self._llm_silent(
             "You are a precise JSON extraction tool. Reply with valid JSON only.",
@@ -1680,12 +1702,69 @@ class VoiceAssistant:
             self._cal_create_reminder(user_input, pre_extracted=data_json)
             return
 
+        # Sanitize LLM output: sometimes the model returns the STRING "null"
+        # instead of real JSON null, which would then be used as a literal
+        # event location / note / whatever. Normalize those to None.
+        def _clean_optional(value):
+            if value is None:
+                return None
+            s = str(value).strip()
+            if s.lower() in ("null", "none", "n/a", "na", "nil", ""):
+                return None
+            return s
+
         title = (data_json.get("title") or "New event").strip()
         date_field = data_json.get("date") or "today"
         start_time = data_json.get("start_time")
         end_time = data_json.get("end_time")
-        location = data_json.get("location")
-        notes = data_json.get("notes")
+        location = _clean_optional(data_json.get("location"))
+        notes = _clean_optional(data_json.get("notes"))
+
+        # Title sanitation. Strip a leading "Jarvis" or day name if the LLM
+        # let it slip in despite the prompt's warnings. Also reject pure
+        # day-name titles like "Saturday".
+        _title_cleaned = re.sub(
+            r"^\s*(?:jarvis|hey\s+jarvis|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*[,:\-]?\s*",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        ).strip()
+        if _title_cleaned:
+            title = _title_cleaned
+        if title.lower() in (
+            "monday", "tuesday", "wednesday", "thursday",
+            "friday", "saturday", "sunday", "jarvis", "",
+        ):
+            # Fallback title based on the user's raw utterance
+            if re.search(r"\b(?:working|shift|work)\b", user_input.lower()):
+                title = "Work"
+            elif re.search(r"\b(?:meeting|1:1|stand\s*up|standup)\b", user_input.lower()):
+                title = "Meeting"
+            elif re.search(r"\b(?:dentist|doctor|appointment)\b", user_input.lower()):
+                title = "Appointment"
+            else:
+                title = "Event"
+
+        # Date correction. If the LLM returned "today" or today's ISO date
+        # but the user's utterance contains an explicit weekday name, prefer
+        # the weekday — this was the "I'm working Saturday" → today bug.
+        _today_iso = datetime.date.today().isoformat()
+        _date_str = str(date_field).lower().strip()
+        if _date_str in ("today", "now", _today_iso):
+            _weekday_match = re.search(
+                r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+                user_input.lower(),
+            )
+            if _weekday_match and not re.search(
+                r"\b(?:today|right\s+now|this\s+morning|this\s+afternoon|this\s+evening|tonight)\b",
+                user_input.lower(),
+            ):
+                new_date = _weekday_match.group(1)
+                print(
+                    f"[Calendar] LLM returned {date_field!r} but user said "
+                    f"'{new_date}' — overriding date to {new_date!r}"
+                )
+                date_field = new_date
 
         resolved_date = self._resolve_relative_date(str(date_field))
         st = self._parse_time(start_time) or (9, 0)
@@ -1947,6 +2026,14 @@ class VoiceAssistant:
         if self._summarizing:
             return
         self._summarizing = True
+        # Capture + clear the "first run" flag at the very top so even an
+        # early return (nothing to summarize yet) counts as "the startup
+        # attempt has happened". Without this, a fresh session with no
+        # prior conversations would hit the early return below, leave the
+        # flag True, and then speak "updating my memory" on the user's
+        # FIRST return-to-wake-mode — exactly the bug Nicholas reported.
+        was_first_summarization = self._first_summarization
+        self._first_summarization = False
         try:
             unsummarized = memory.get_unsummarized_exchanges()
             batches = memory.batch_conversations_for_summary(unsummarized)
@@ -1960,7 +2047,7 @@ class VoiceAssistant:
 
             # Only speak the memory-update line on the initial startup run.
             # Re-entries from inactivity timeout or manual return-to-wake stay silent.
-            if SPEAK_MEMORY_UPDATE and self._first_summarization:
+            if SPEAK_MEMORY_UPDATE and was_first_summarization:
                 try:
                     self.speak_direct("One moment, Sir. Updating my memory.")
                 except Exception as e:
@@ -1970,7 +2057,6 @@ class VoiceAssistant:
                     # since we're summarizing from the wake-mode hook.
                     if not self._in_conversation:
                         ws_server.set_state("wake")
-            self._first_summarization = False
 
             for batch in batches:
                 try:
@@ -2320,14 +2406,14 @@ class VoiceAssistant:
                     # WAKE MODE: listen for wake word
                     detected = self._listen_for_wake_word()
                     if detected:
-                        # Short drain + short sleep after wake-word fires.
-                        # A long delay here would SWALLOW the user's command
-                        # in the single-breath case ("Hey Jarvis, tell me a
-                        # joke"): the mic would open after the sentence is
-                        # already finished. Keep the delay minimal and let
-                        # the echo-stripping logic below handle any
-                        # "hey jarvis" tail that slips into the transcript.
-                        time.sleep(0.2)
+                        # NO sleep here — every millisecond we wait is
+                        # a millisecond of the user's single-breath
+                        # command that gets lost before the mic opens.
+                        # Previous versions tried 0.3s, 1.0s, 0.2s; all
+                        # of them swallowed "Hey Jarvis, tell me a joke"
+                        # said without a pause. The echo-stripping logic
+                        # below handles any wake-phrase tail that leaks
+                        # into the transcript.
                         self._drain_q()
                         self._in_conversation = True
                         self._return_to_wake.clear()
@@ -2424,18 +2510,26 @@ class VoiceAssistant:
                 if self._just_woke:
                     self._just_woke = False
                     _cleaned = re.sub(r"[^\w\s]", "", user_input).strip().lower()
+                    # Prefix order matters: longer phrases must come first
+                    # so "hey jarvis" is tried before the bare "jarvis"
+                    # (otherwise the bare match would swallow the "hey"
+                    # as part of the remainder).
                     _PREFIXES = (
                         "hey jarvis", "hi jarvis", "hello jarvis",
                         "hey jervis", "hey jarvus", "hey jarbis",
+                        # Bare "jarvis" catches the common STT failure mode
+                        # where faster-whisper drops the "Hey" and the
+                        # transcription comes out as "Jarvis tomorrow I'm
+                        # working from 7 to 5". Without this, the LLM
+                        # extraction sees "Jarvis" as the first token and
+                        # cheerfully uses it as the event title.
+                        "jarvis",
                     )
                     _matched_prefix = None
                     for p in _PREFIXES:
                         if _cleaned.startswith(p):
                             _matched_prefix = p
                             break
-                    if _matched_prefix is None and _cleaned == "jarvis":
-                        print(f"  (Ignoring bare wake-phrase echo: {user_input!r})\n")
-                        continue
                     if _matched_prefix is not None:
                         _remainder = _cleaned[len(_matched_prefix):].strip()
                         # Tolerate trailing "hey" or similar junk
