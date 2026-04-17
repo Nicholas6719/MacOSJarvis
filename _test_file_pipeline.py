@@ -126,6 +126,27 @@ import os
 _JARVIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+# Mirror the deterministic regex from VoiceAssistant._parse_destination_from_utterance
+# so the harness exercises the same override logic.
+_DEST_RE = re.compile(
+    r"\b(?:to|into|onto)\s+(?:my\s+|the\s+|a\s+)?"
+    r"(desktop|downloads?|documents?|pictures?|photos?|"
+    r"music|movies?|videos?|home)"
+    r"(?:\s+folder|\s+directory)?\b"
+)
+
+
+def _parse_dest_regex(utterance: str):
+    t = (utterance or "").lower()
+    cleaned = re.sub(
+        r"\bfrom\s+(?:my\s+|the\s+)?\w+(?:\s+folder|\s+directory)?\b",
+        "",
+        t,
+    )
+    m = _DEST_RE.findall(cleaned)
+    return m[-1] if m else None
+
+
 def _no_protected(matches):
     for m in matches:
         if file_manager.is_protected_path(m):
@@ -140,6 +161,22 @@ def _has_rmv(matches):
     if not any("rmv" in m.lower() for m in matches):
         return False, "RMV file missing from matches"
     return True, ""
+
+
+def _dest_extraction_check(expected_substring):
+    """Returns a case-check that validates the LLM extracted the
+    destination correctly — used to catch "from X to Y" confusion."""
+    def _check(matches, extracted=None):
+        ok_proto, why = _no_protected(matches)
+        if not ok_proto:
+            return False, why
+        if extracted is None:
+            return True, ""
+        dest = (extracted.get("destination") or "").lower()
+        if expected_substring.lower() not in dest:
+            return False, f"destination {dest!r} missing {expected_substring!r}"
+        return True, ""
+    return _check
 
 
 CASES = [
@@ -157,6 +194,13 @@ CASES = [
     ("Moved the rmv file to my documents", _has_rmv),
     ("Put the RMV file on my desktop", _has_rmv),
     ("Take the rmv file and put it in Downloads", _has_rmv),
+    # "from X to Y" and "from X into Y" — LLM must put Y (not X)
+    # as destination. This is the regression that made the third
+    # attempt in Nicholas's log go Downloads -> Downloads.
+    ("Move the rmv file from my downloads folder into the documents folder",
+     _dest_extraction_check("Documents")),
+    ("Move the rmv file from my desktop to my downloads folder",
+     _dest_extraction_check("Downloads")),
     # Regression — Jarvis must not suggest its own memory.db, config, etc.
     ("Move my Jarvis file to Downloads",        _no_protected),
     ("Move the Jarvis memory file to Desktop",  _no_protected),
@@ -184,13 +228,24 @@ def _run_cases(label: str, cases, spotlight_blind: bool = False) -> tuple[int, i
             query = (data.get("query") or "").strip() or utt
             matches = file_manager.search_file(query)
             dest = data.get("destination")
+            # Apply the same deterministic override the production
+            # handler uses so the harness tests the full pipeline.
+            regex_dest = _parse_dest_regex(utt)
+            if regex_dest:
+                dest = regex_dest
+                data["destination"] = regex_dest
             resolved = file_manager.resolve_destination(dest) if dest else None
             print(f"  destination={dest!r}  resolved={resolved!r}")
             print(f"  matches ({len(matches)}):")
             for m in matches:
                 marker = " [PROTECTED!]" if file_manager.is_protected_path(m) else ""
                 print(f"    - {m}{marker}")
-            passed, why = check(matches)
+            # Check signature may be either check(matches) or
+            # check(matches, extracted). Support both.
+            try:
+                passed, why = check(matches, data)
+            except TypeError:
+                passed, why = check(matches)
             if passed:
                 print("  ok")
                 ok += 1

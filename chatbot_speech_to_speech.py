@@ -2653,14 +2653,20 @@ class VoiceAssistant:
     # confirms.
 
     # Words Jarvis treats as confirmation when a file-action is pending.
+    # Includes "please" by itself — a common polite single-word yes that
+    # users give in response to "Is this the one you want to move?" and
+    # that the previous list treated as a no.
     _FILE_YES_WORDS = (
         "yes", "yeah", "yep", "yup", "sure", "correct", "right", "that's it",
         "thats it", "do it", "go ahead", "confirm", "affirmative", "please do",
-        "that one", "this one", "ok", "okay",
+        "do it please", "please", "yes please", "please move", "please rename",
+        "that one", "this one", "ok", "okay", "alright", "fine", "proceed",
+        "absolutely", "definitely", "go for it", "by all means", "yup please",
     )
     _FILE_NO_WORDS = (
         "no", "nope", "nah", "wrong", "wrong file", "not that", "not that one",
         "not it", "cancel", "never mind", "nevermind", "stop", "abort",
+        "don't", "dont", "don't do", "dont do",
     )
 
     # ── Follow-up context ──────────────────────────────────────────
@@ -2782,6 +2788,37 @@ class VoiceAssistant:
 
         return None
 
+    # Common spoken location names → the key used by resolve_destination.
+    # Only words we're 100% sure refer to a standard user folder go here;
+    # anything more exotic stays with the LLM.
+    _DEST_REGEX = re.compile(
+        r"\b(?:to|into|onto)\s+(?:my\s+|the\s+|a\s+)?"
+        r"(desktop|downloads?|documents?|pictures?|photos?|"
+        r"music|movies?|videos?|home)"
+        r"(?:\s+folder|\s+directory)?\b"
+    )
+
+    def _parse_destination_from_utterance(self, utterance: str) -> Optional[str]:
+        """Deterministic destination extraction. Strips out 'from X' spans
+        first (so 'from my downloads folder to documents' doesn't match
+        'downloads'), then pulls the word after the FINAL to/into/onto
+        preposition. Returns a canonical short label (e.g. 'downloads')
+        that resolve_destination knows how to map."""
+        t = (utterance or "").lower()
+        # Remove "from <folder>" and "from my <folder>" phrases up front,
+        # so the destination regex can only match a post-"to" word.
+        cleaned = re.sub(
+            r"\bfrom\s+(?:my\s+|the\s+)?\w+(?:\s+folder|\s+directory)?\b",
+            "",
+            t,
+        )
+        matches = self._DEST_REGEX.findall(cleaned)
+        if not matches:
+            return None
+        # Prefer the last occurrence — "take it from Downloads to Desktop"
+        # has both matched by the regex, and the destination is the last.
+        return matches[-1]
+
     def _extract_file_json(self, utterance: str) -> Optional[dict]:
         """LLM-extracted details for a file-management utterance. Returns
         a dict with query / action / destination / new_name, or None."""
@@ -2796,8 +2833,12 @@ class VoiceAssistant:
             "use that. Examples: 'resume', 'taxes 2024', "
             "'rmv-realid-application-steps'.\n"
             "- action: one of move / rename / describe / find\n"
-            "- destination: a string OR null. Resolve spoken locations "
-            "to absolute paths — Desktop -> /Users/nicholascoppola/Desktop, "
+            "- destination: a string OR null. This is where the file is "
+            "going TO — the TARGET. It is the place named after 'to', "
+            "'into', 'onto', 'on', or 'in'. It is NEVER the place named "
+            "after 'from' — that is the source, which you must ignore. "
+            "Resolve spoken locations to absolute paths: "
+            "Desktop -> /Users/nicholascoppola/Desktop, "
             "Documents -> /Users/nicholascoppola/Documents, "
             "Downloads -> /Users/nicholascoppola/Downloads, "
             "Pictures -> /Users/nicholascoppola/Pictures, "
@@ -2807,6 +2848,10 @@ class VoiceAssistant:
             "renaming the file; otherwise null.\n\n"
             "Examples:\n"
             "  'move the rmv file from my desktop to my documents folder' -> "
+            "{\"query\": \"rmv\", \"action\": \"move\", "
+            "\"destination\": \"/Users/nicholascoppola/Documents\", "
+            "\"new_name\": null}\n"
+            "  'move the rmv file from my downloads folder into the documents folder' -> "
             "{\"query\": \"rmv\", \"action\": \"move\", "
             "\"destination\": \"/Users/nicholascoppola/Documents\", "
             "\"new_name\": null}\n"
@@ -2875,6 +2920,18 @@ class VoiceAssistant:
             query = (data.get("query") or "").strip()
             destination = data.get("destination")
             new_name = data.get("new_name")
+
+            # Deterministic destination override. The 3B LLM sometimes
+            # confuses 'from X to Y' — returning X as destination instead
+            # of Y. A regex that strips 'from <folder>' spans first and
+            # then pulls the post-'to' word is more reliable for the
+            # common user-folder vocabulary.
+            regex_dest = self._parse_destination_from_utterance(user_input)
+            if regex_dest:
+                if destination and regex_dest.lower() not in str(destination).lower():
+                    print(f"[File] destination override: LLM={destination!r} "
+                          f"-> regex={regex_dest!r}")
+                destination = regex_dest
 
             # Follow-up branch: user said "move that to X" referring to
             # the just-touched file. Skip search — we already know the
@@ -2946,6 +3003,22 @@ class VoiceAssistant:
                     "Try again with a destination."
                 )
                 return
+
+            # Guard: if the resolved destination is the folder the file
+            # already lives in, the LLM likely confused source and
+            # destination (e.g. "from my downloads folder into documents"
+            # being extracted as destination=Downloads). Refuse rather
+            # than queue a no-op move that will later fail as
+            # "file already exists".
+            if action == "move" and matches and resolved_dest:
+                current_dir = str(Path(matches[0]).parent)
+                dest_dir = str(Path(resolved_dest).expanduser())
+                if os.path.normpath(current_dir) == os.path.normpath(dest_dir):
+                    self.speak_direct(
+                        f"That file is already in your {self._dest_label(dest_dir)} "
+                        "folder, Sir. Where would you like me to move it to?"
+                    )
+                    return
 
             if action == "rename" and not (new_name and str(new_name).strip()):
                 self.speak_direct(
