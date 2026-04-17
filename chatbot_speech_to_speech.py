@@ -1763,17 +1763,23 @@ class VoiceAssistant:
         if not reminders:
             self._safe_speak("You have no open reminders, Sir.")
             return
+        # The reminders list is already sorted earliest-due-first by
+        # calendar_reminders.get_all_reminders() — we just need to make
+        # sure the LLM preserves that order when it phrases the summary.
         lines = []
-        for r in reminders:
-            parts = [f"- {r.get('title', '')}"]
+        for idx, r in enumerate(reminders, start=1):
+            parts = [f"{idx}. {r.get('title', '')}"]
             if r.get("due"):
-                parts.append(f"due {r['due']}")
+                parts.append(f"(due {r['due']})")
             lines.append(" ".join(parts))
         prompt = (
-            "These are the user's open reminders. Summarize them naturally "
-            "and conversationally in Jarvis's voice — not a list, not a "
-            "script, just how a sharp assistant would say them out loud. "
-            "Keep it brief, two to four sentences.\n\n"
+            "These are the user's open reminders, listed in chronological "
+            "order — earliest due date first. Summarize them naturally and "
+            "conversationally in Jarvis's voice — not a list, not a script, "
+            "just how a sharp assistant would say them out loud. "
+            "IMPORTANT: mention the reminders in the exact order they are "
+            "given below (earliest due date first, latest last). Do not "
+            "rearrange them. Keep it brief, two to four sentences.\n\n"
             + "\n".join(lines)
         )
         text = self._llm_silent(self._JARVIS_CAL_SYSTEM, prompt, max_tokens=220)

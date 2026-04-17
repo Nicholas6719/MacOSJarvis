@@ -321,7 +321,8 @@ def get_all_reminders() -> list:
 
 
 def _get_reminders_via_eventkit() -> list:
-    """Fetch incomplete reminders via the native EventKit API.
+    """Fetch incomplete reminders via the native EventKit API, sorted by
+    due date (earliest first; no-due-date items come last).
     Result shape matches the AppleScript path: dicts with title/due/notes."""
     store = _EK.EKEventStore.alloc().init()
     # Predicate for all incomplete reminders in all calendars.
@@ -345,7 +346,8 @@ def _get_reminders_via_eventkit() -> list:
     if not result["done"].wait(timeout=10):
         raise RuntimeError("EventKit reminder fetch timed out")
 
-    out = []
+    # Collect with a parallel Python datetime for sorting, then strip it.
+    rows = []
     for r in result["reminders"] or []:
         try:
             title = r.title() or ""
@@ -356,6 +358,7 @@ def _get_reminders_via_eventkit() -> list:
 
         # Due date, if any. dueDateComponents() returns NSDateComponents.
         due_str = ""
+        due_dt: Optional[datetime.datetime] = None
         try:
             comps = r.dueDateComponents()
             if comps is not None:
@@ -365,14 +368,14 @@ def _get_reminders_via_eventkit() -> list:
                 h = comps.hour()
                 mi = comps.minute()
                 if y and mo and d:
-                    dt = datetime.datetime(
+                    due_dt = datetime.datetime(
                         y, mo, d,
                         h if (h is not None and h >= 0) else 0,
                         mi if (mi is not None and mi >= 0) else 0,
                     )
                     # Format the same way AppleScript does:
                     # "Saturday, April 18, 2026 at 10:30:00 AM"
-                    due_str = dt.strftime("%A, %B %-d, %Y at %-I:%M:%S %p")
+                    due_str = due_dt.strftime("%A, %B %-d, %Y at %-I:%M:%S %p")
         except Exception:
             pass
 
@@ -382,8 +385,13 @@ def _get_reminders_via_eventkit() -> list:
         except Exception:
             notes = ""
 
-        out.append({"title": title, "due": due_str, "notes": notes})
-    return out
+        rows.append((due_dt, {"title": title, "due": due_str, "notes": notes}))
+
+    # Sort by due date ascending. Items with no due date sort LAST so
+    # "what's due soon" comes first and untimed tasks trail.
+    _max_dt = datetime.datetime.max
+    rows.sort(key=lambda x: (x[0] is None, x[0] or _max_dt))
+    return [row[1] for row in rows]
 
 
 def _get_reminders_via_applescript() -> list:
