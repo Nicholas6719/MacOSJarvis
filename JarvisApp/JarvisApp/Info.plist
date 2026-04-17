@@ -33,6 +33,24 @@
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Jarvis needs microphone access to hear your voice commands.</string>
 
+	<!-- Calendar & Reminders access.
+	     On macOS 14 (Sonoma) and later, apps get WRITE-ONLY calendar/reminder
+	     access by default — they can create events but cannot read them. The
+	     *FullAccessUsageDescription keys are what tell macOS the app needs
+	     read access too, which triggers the "Full Access" permission prompt
+	     instead of the "Write Only" default. The non-FullAccess keys are
+	     kept for older macOS versions that use the legacy single-tier key.
+	     Without these, "what's on my calendar this week?" returns an empty
+	     list from AppleScript even though events clearly exist. -->
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Jarvis needs full access to your calendar to read events when you ask what's on your schedule and to create events when you dictate a new one.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Jarvis needs calendar access to read your events and create new ones by voice.</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>Jarvis needs full access to your reminders to read your open reminders and create new ones by voice.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>Jarvis needs reminders access to read and create reminders by voice.</string>
+
 	<!-- Allow plain HTTP/WS to localhost -->
 	<key>NSAppTransportSecurity</key>
 	<dict>
