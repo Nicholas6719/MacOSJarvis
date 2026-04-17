@@ -267,6 +267,16 @@ class VoiceAssistant:
         #    "waiting_for": "confirmation"|"selection"}
         self._pending_file_action: Optional[dict] = None
 
+        # _last_file_action records the most recent successful file op
+        # so follow-up utterances like "actually, move that to Documents"
+        # can resolve the pronoun back to the file. Shape:
+        #   {"path": "<current filesystem path>",
+        #    "original_path": "<pre-action path>",
+        #    "action": "move"|"rename",
+        #    "timestamp": float}
+        # Times out after a few minutes — see _has_recent_file_action.
+        self._last_file_action: Optional[dict] = None
+
         # Wake word state
         self._in_conversation = False
         # Set True immediately after the wake word fires, cleared as soon
@@ -2653,6 +2663,47 @@ class VoiceAssistant:
         "not it", "cancel", "never mind", "nevermind", "stop", "abort",
     )
 
+    # ── Follow-up context ──────────────────────────────────────────
+    # A just-completed move/rename leaves _last_file_action set.
+    # Within this window, pronoun references like "move that to
+    # Documents" resolve back to the file we just touched, so the
+    # user doesn't have to name it again.
+    _FILE_FOLLOWUP_WINDOW_S = 180.0  # 3 minutes
+
+    # Phrases that indicate the user is referring to a previously
+    # handled file by pronoun rather than naming a new one.
+    _FILE_PRONOUN_RE = re.compile(
+        r"\b(?:it|that|this|them|those|the\s+(?:same\s+)?(?:file|one|document|doc|image|photo|picture)|"
+        r"the\s+rmv|same\s+(?:file|one))\b"
+    )
+
+    def _has_recent_file_action(self) -> bool:
+        lfa = self._last_file_action
+        if not lfa:
+            return False
+        ts = lfa.get("timestamp", 0) or 0
+        if (time.time() - ts) >= self._FILE_FOLLOWUP_WINDOW_S:
+            self._last_file_action = None
+            return False
+        # Also verify the file is still where we last left it.
+        path = lfa.get("path") or ""
+        if not path or not os.path.exists(path):
+            self._last_file_action = None
+            return False
+        return True
+
+    def _utterance_is_pronoun_ref(self, text: str) -> bool:
+        return bool(self._FILE_PRONOUN_RE.search((text or "").lower()))
+
+    def _record_file_action(self, action: str, new_path: str,
+                            original_path: str) -> None:
+        self._last_file_action = {
+            "action": action,
+            "path": new_path,
+            "original_path": original_path,
+            "timestamp": time.time(),
+        }
+
     def _detect_file_intent(self, text: str) -> Optional[str]:
         """Return one of file_move / file_rename / file_describe /
         file_find, or None if no file-management intent is present."""
@@ -2661,15 +2712,23 @@ class VoiceAssistant:
             return None
 
         has_file_noun = bool(re.search(
-            r"\b(file|document|doc|pdf|image|picture|photo|spreadsheet|"
-            r"resume|presentation|slides|note|notes|word\s+doc|"
-            r"word\s+document)\b", t
+            r"\b(file|files|document|documents|doc|docs|pdf|pdfs|image|images|"
+            r"picture|pictures|photo|photos|spreadsheet|spreadsheets|"
+            r"resume|resumes|presentation|presentations|slides|"
+            r"note|notes|word\s+doc|word\s+document)\b", t
         ))
         has_file_ext = bool(re.search(
             r"\.(?:pdf|docx?|txt|md|png|jpe?g|gif|heic|tiff|bmp|csv|xlsx?|pptx?)\b",
             t,
         ))
-        file_ref = has_file_noun or has_file_ext
+        # Pronoun reference counts as a file reference ONLY when we have
+        # a recent file action to resolve it against. Otherwise "move
+        # that to the left" would false-positive.
+        has_followup_pronoun = (
+            self._has_recent_file_action()
+            and self._utterance_is_pronoun_ref(t)
+        )
+        file_ref = has_file_noun or has_file_ext or has_followup_pronoun
 
         # Rename — strong, unambiguous phrasing. Allow with or without
         # "file"/"document" because "rename X to Y" is itself a clear
@@ -2817,17 +2876,29 @@ class VoiceAssistant:
             destination = data.get("destination")
             new_name = data.get("new_name")
 
-            if not query:
-                # Fall back to the full utterance if the LLM gave us nothing.
-                query = re.sub(
-                    r"\b(?:please|jarvis|could\s+you|can\s+you|would\s+you)\b",
-                    "",
-                    user_input,
-                    flags=re.IGNORECASE,
-                ).strip()
+            # Follow-up branch: user said "move that to X" referring to
+            # the just-touched file. Skip search — we already know the
+            # path from _last_file_action. This is the only way an
+            # utterance with no explicit filename can still succeed.
+            if (
+                self._has_recent_file_action()
+                and self._utterance_is_pronoun_ref(user_input)
+            ):
+                lfa_path = self._last_file_action["path"]
+                print(f"[File] follow-up pronoun ref — using last action path {lfa_path!r}")
+                matches = [lfa_path]
+            else:
+                if not query:
+                    # Fall back to the full utterance if the LLM gave us nothing.
+                    query = re.sub(
+                        r"\b(?:please|jarvis|could\s+you|can\s+you|would\s+you)\b",
+                        "",
+                        user_input,
+                        flags=re.IGNORECASE,
+                    ).strip()
 
-            print(f"[File] search query={query!r}")
-            matches = file_manager.search_file(query)
+                print(f"[File] search query={query!r}")
+                matches = file_manager.search_file(query)
             print(f"[File] matches={len(matches)}")
             for m in matches:
                 print(f"[File]   - {m}")
@@ -3089,6 +3160,9 @@ class VoiceAssistant:
             ok, msg = file_manager.move_file(original_path, destination)
             if ok:
                 dest_label = self._dest_label(destination)
+                # `msg` is the new path — record it so follow-up "move
+                # that to X" utterances can find the file.
+                self._record_file_action("move", msg, original_path)
                 self._safe_speak(f"Done, Sir — moved it to the {dest_label}.")
             else:
                 self._safe_speak(f"I wasn't able to move that file, Sir. {msg}.")
@@ -3098,6 +3172,7 @@ class VoiceAssistant:
             new_name = pending.get("new_name") or ""
             ok, msg = file_manager.rename_file(original_path, str(new_name))
             if ok:
+                self._record_file_action("rename", msg, original_path)
                 self._safe_speak(f"Done, Sir — renamed to {Path(msg).name}.")
             else:
                 self._safe_speak(f"I wasn't able to rename that file, Sir. {msg}.")
