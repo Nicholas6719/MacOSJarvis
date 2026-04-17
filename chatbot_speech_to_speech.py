@@ -38,6 +38,7 @@ import calendar_reminders
 import file_manager
 import browser_control
 import screen_awareness
+import tts_engine
 
 # Set of known spoken site names from browser_control, used to decide
 # whether a bare "open X" utterance should route to Brave vs the Mac app
@@ -611,6 +612,16 @@ class VoiceAssistant:
         self._speed: float = float(c.get("speed", 1.0))
         print("[TTS] Ready")
 
+        tts_engine.configure(self.cfg)
+        tts_engine.register_kokoro(self._kokoro, self._voice, self._speed)
+        active = tts_engine.get_active_backend()
+        if active == "fishaudio":
+            logger.info(
+                f"TTS backend: Fish Audio (voice {c.get('fishaudio_voice_id')})"
+            )
+        else:
+            logger.info("TTS backend: Kokoro (local)")
+
     def _load_stt(self) -> None:
         from faster_whisper import WhisperModel
 
@@ -791,10 +802,7 @@ class VoiceAssistant:
     # ── TTS ───────────────────────────────────────────────────────────────────
 
     def _synthesise(self, text: str) -> np.ndarray:
-        samples, _ = self._kokoro.create(
-            text, voice=self._voice, speed=self._speed, lang="en-us"
-        )
-        return np.asarray(samples, dtype=np.float32)
+        return tts_engine.synthesize(text)
 
     # Cutoff (in words) below which speak_direct synthesizes the whole
     # phrase in one shot instead of firing up the streaming pipeline.
