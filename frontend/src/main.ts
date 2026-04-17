@@ -121,6 +121,24 @@ interface FilePreviewEvent {
   cache_buster?: number;
 }
 
+interface ScreenPreviewEvent {
+  type?: string;
+  image_url?: string;
+  cache_buster?: number;
+}
+
+function showScreenPreview(e: ScreenPreviewEvent): void {
+  previewNameEl.textContent = "What I can see right now";
+  previewBodyEl.replaceChildren();
+  const bust = e.cache_buster ? `?v=${e.cache_buster}` : "";
+  const src = (e.image_url || "http://localhost:3000/preview_screen") + bust;
+  const img = document.createElement("img");
+  img.src = src;
+  img.alt = "screen";
+  previewBodyEl.appendChild(img);
+  previewEl.hidden = false;
+}
+
 function hideFilePreview(): void {
   previewEl.hidden = true;
   previewNameEl.textContent = "";
@@ -185,7 +203,7 @@ function connect(): void {
         muted?: boolean;
         action?: string;
         type?: string;
-      } & FilePreviewEvent;
+      } & FilePreviewEvent & ScreenPreviewEvent;
       if (data.action === "demo") {
         orb.triggerDemo();
         return;
@@ -195,6 +213,14 @@ function connect(): void {
         return;
       }
       if (data.type === "file_preview_clear") {
+        hideFilePreview();
+        return;
+      }
+      if (data.type === "screen_preview") {
+        showScreenPreview(data);
+        return;
+      }
+      if (data.type === "screen_preview_clear") {
         hideFilePreview();
         return;
       }

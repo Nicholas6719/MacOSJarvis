@@ -34,6 +34,7 @@ import ws_server
 import calendar_reminders
 import file_manager
 import browser_control
+import screen_awareness
 
 # Set of known spoken site names from browser_control, used to decide
 # whether a bare "open X" utterance should route to Brave vs the Mac app
@@ -3080,6 +3081,126 @@ class VoiceAssistant:
             "timestamp": time.time(),
         }
 
+    # ── Screen awareness ────────────────────────────────────────────────────
+    _SCREEN_DESCRIBE_PATTERNS = (
+        r"\bwhat(?:'?s|\s+is)\s+on\s+(?:my\s+)?screen\b",
+        r"\bwhat(?:'?s|\s+is)\s+on\s+(?:my\s+)?display\b",
+        r"\bwhat\s+do\s+you\s+see\b",
+        r"\bdescribe\s+(?:my\s+)?screen\b",
+        r"\bwhat(?:'?s|\s+is)\s+open\b",
+        r"\blook\s+at\s+(?:my\s+)?screen\b",
+        r"\bwhat\s+am\s+i\s+looking\s+at\b",
+        r"\bcan\s+you\s+see\s+(?:my\s+)?screen\b",
+    )
+
+    def _detect_screen_intent(self, text: str) -> Optional[str]:
+        """Return 'screen_describe' if the user is asking about what's on
+        their screen, else None. Strict regex only — casual mentions of
+        'screen' shouldn't trigger a capture."""
+        t = (text or "").lower().strip()
+        if not t:
+            return None
+        for pat in self._SCREEN_DESCRIBE_PATTERNS:
+            if re.search(pat, t):
+                return "screen_describe"
+        return None
+
+    def _push_screen_preview(self) -> None:
+        try:
+            ws_server.send_event({
+                "type": "screen_preview",
+                "image_url": "http://localhost:3000/preview_screen",
+                "cache_buster": int(time.time() * 1000),
+            })
+        except Exception as e:
+            print(f"[Screen] push preview error: {e}")
+
+    def _clear_screen_preview(self) -> None:
+        try:
+            ws_server.send_event({"type": "screen_preview_clear"})
+        except Exception as e:
+            print(f"[Screen] clear preview error: {e}")
+
+    def _handle_screen_command(self, intent: str, user_input: str) -> None:
+        """Kick off screen awareness on a background thread so the voice
+        pipeline stays responsive. Announces briefly, captures, optionally
+        previews in the orb, runs Moondream under the LLM lock, cleans up,
+        then speaks the description."""
+        worker = threading.Thread(
+            target=self._screen_worker_body,
+            args=(intent, user_input),
+            daemon=True,
+            name="screen-worker",
+        )
+        worker.start()
+
+    def _screen_worker_body(self, intent: str, user_input: str) -> None:
+        try:
+            self._safe_speak("Let me take a look.")
+
+            # Capture first so the orb preview has something to show.
+            path = screen_awareness.capture_screen()
+            if not os.path.isfile(path):
+                self._safe_speak(
+                    "I couldn't capture the screen, Sir. You may need to "
+                    "grant Screen Recording permission in System Settings."
+                )
+                return
+
+            orb_mode = screen_awareness.is_orb_mode()
+            if orb_mode:
+                self._push_screen_preview()
+
+            # Warn the user if we're about to trigger a first-run download.
+            try:
+                from screen_awareness import (
+                    _MOONDREAM_CACHE_DIR, _MOONDREAM_MODEL_FILENAME,
+                )
+                model_file = _MOONDREAM_CACHE_DIR / _MOONDREAM_MODEL_FILENAME
+                first_run = not model_file.is_file()
+            except Exception:
+                first_run = False
+            if first_run and screen_awareness._vision_model is None:
+                self._safe_speak(
+                    "Give me a moment — loading the vision model for the first time."
+                )
+
+            # Moondream is an LLM-class load — serialize with the main LLM
+            # lock so we don't crash llama-cpp by running two heavy models
+            # on the GPU at once.
+            try:
+                with self._llm_lock:
+                    description = screen_awareness.describe_screen(path)
+            except Exception as e:
+                print(f"[Screen] describe error: {e}")
+                import traceback
+                traceback.print_exc()
+                description = ""
+
+            screen_awareness.cleanup_screenshot()
+            if orb_mode:
+                self._clear_screen_preview()
+
+            if description:
+                self._safe_speak(description)
+            else:
+                self._safe_speak(
+                    "I wasn't able to make sense of what's on your screen, Sir."
+                )
+        except Exception as e:
+            print(f"[Screen] worker error: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                screen_awareness.cleanup_screenshot()
+            except Exception:
+                pass
+            if screen_awareness.is_orb_mode():
+                self._clear_screen_preview()
+            self._safe_speak(
+                "I ran into a problem looking at your screen, Sir."
+            )
+
     def _detect_file_intent(self, text: str) -> Optional[str]:
         """Return one of file_move / file_rename / file_describe /
         file_find, or None if no file-management intent is present."""
@@ -4321,10 +4442,12 @@ class VoiceAssistant:
                 # Clipboard augmentation
                 augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
 
-                # System command, calendar intent, file intent, or LLM
+                # System command, calendar intent, file intent, screen
+                # intent, or LLM
                 sys_response = self._handle_system_command(user_input)
                 cal_intent = None
                 file_intent = None
+                screen_intent = None
                 if not sys_response:
                     # Only probe calendar intent when no system command
                     # matched — keeps timer-style reminders ("remind me in
@@ -4334,6 +4457,8 @@ class VoiceAssistant:
                     cal_intent = self._detect_calendar_intent(user_input)
                     if cal_intent is None:
                         file_intent = self._detect_file_intent(user_input)
+                    if cal_intent is None and file_intent is None:
+                        screen_intent = self._detect_screen_intent(user_input)
 
                 if sys_response and sys_response != WAKE_MODE_SENTINEL:
                     print(f"System: {sys_response}")
@@ -4349,6 +4474,9 @@ class VoiceAssistant:
                 elif file_intent is not None:
                     print(f"[File] Intent: {file_intent}")
                     self._handle_file_command(file_intent, user_input)
+                elif screen_intent is not None:
+                    print(f"[Screen] Intent: {screen_intent}")
+                    self._handle_screen_command(screen_intent, user_input)
                 else:
                     # Build the one-turn memory context block if we have search hits.
                     memory_context: Optional[str] = None

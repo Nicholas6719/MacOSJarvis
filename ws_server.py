@@ -189,6 +189,33 @@ def _handle_preview_file(handler: http.server.BaseHTTPRequestHandler) -> None:
     handler.wfile.write(data)
 
 
+def _handle_preview_screen(handler: http.server.BaseHTTPRequestHandler) -> None:
+    """Serve the current one-shot screenshot captured by screen_awareness.
+    Returns 404 when no screenshot is active. The file lives in /tmp and
+    is deleted immediately after the description is spoken."""
+    try:
+        import screen_awareness
+    except Exception as e:
+        handler.send_error(500, f"screen preview unavailable: {e}")
+        return
+    path = screen_awareness.get_active_screenshot_path()
+    if not path or not os.path.isfile(path):
+        handler.send_error(404, "no active screenshot")
+        return
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except Exception as e:
+        handler.send_error(500, f"screenshot read error: {e}")
+        return
+    handler.send_response(200)
+    handler.send_header("Content-Type", "image/png")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Content-Disposition", "inline")
+    _cors_end_headers(handler)
+    handler.wfile.write(data)
+
+
 def _handle_api_mute(handler: http.server.BaseHTTPRequestHandler) -> None:
     length = int(handler.headers.get("Content-Length", "0"))
     raw = handler.rfile.read(length) if length > 0 else b"{}"
@@ -279,6 +306,9 @@ def _serve_http() -> None:
                 return
             if path0 == "/preview_file":
                 _handle_preview_file(self)
+                return
+            if path0 == "/preview_screen":
+                _handle_preview_screen(self)
                 return
             super().do_GET()
 
