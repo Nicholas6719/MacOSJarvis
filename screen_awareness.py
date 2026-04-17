@@ -107,12 +107,19 @@ def warm_up_in_background() -> None:
     """Fire-and-forget background load so the first real screen-describe
     call doesn't pay the model-load cost. Safe to call at startup even
     before the model file has been downloaded."""
+    import logging
+    import time as _time
+    _log = logging.getLogger("jarvis")
+
     def _run() -> None:
+        t0 = _time.monotonic()
         try:
             load_vision_model()
-            print("[screen_awareness] vision model warm.")
+            elapsed = _time.monotonic() - t0
+            _log.info(f"Moondream loaded in {elapsed:.2f}s")
+            print(f"[screen_awareness] vision model warm ({elapsed:.2f}s).")
         except Exception as e:
-            print(f"[screen_awareness] warm-up failed: {e}")
+            _log.exception(f"[screen_awareness] warm-up failed: {e}")
     threading.Thread(target=_run, daemon=True, name="moondream-warmup").start()
 
 

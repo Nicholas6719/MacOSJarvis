@@ -199,12 +199,17 @@ FRAME_MS     = 30
 FRAME_SIZE   = int(SAMPLE_RATE * FRAME_MS / 1_000)
 
 # Adaptive silence: short for quick commands, longer once you've been speaking a while.
-# 500ms is the floor — anything lower and Jarvis will cut users off mid-sentence.
-# LONG was 950ms; tightened to 600ms so the response latency after a long
-# utterance is ~350ms faster with no measurable truncation risk.
-SILENCE_CUTOFF_SHORT_MS  = 500
-SILENCE_CUTOFF_LONG_MS   = 600
+# Raised from 500/600 to 700/750 — the tighter values were cutting users off
+# mid-sentence on natural pauses ("do you know my … favorite color"). 700ms
+# leaves room for mid-phrase breathing without feeling sluggish.
+SILENCE_CUTOFF_SHORT_MS  = 700
+SILENCE_CUTOFF_LONG_MS   = 750
 LONG_SPEECH_THRESHOLD_MS = 2_500   # use long cutoff after 2.5 s of speech
+
+# Hard cap on how long a single utterance recording can run. Prevents a
+# stuck VAD state or a runaway mic from filling RAM indefinitely. 15s is
+# comfortably longer than any natural voice command.
+MAX_RECORDING_MS = 15_000
 
 # Dropped from 4096 (~170 ms at 24 kHz) to 1024 (~42 ms). sounddevice's
 # callback fires once per block, so the first-audio latency after we feed()
@@ -227,6 +232,41 @@ NOISE_FLOOR_RMS = 150  # Minimum RMS energy to consider audio as speech
 # about background memory work. Explicit commands ("remember X", "forget X",
 # "what do you know about me") still speak naturally.
 SPEAK_MEMORY_UPDATE = False
+
+# Keywords that signal an utterance needs the full intent pipeline (calendar,
+# file, browser, screen, system command, memory command). Checked as whole
+# words. Keep broad — a false positive just costs us the fast path for one
+# turn; a false negative routes a command through the LLM instead of the
+# matching handler.
+_FAST_PATH_BANNED = frozenset({
+    "remind", "calendar", "schedule", "remember", "forget",
+    "file", "move", "rename", "find", "browser", "open",
+    "screen", "timer", "battery", "volume", "brightness",
+    "music", "lock", "shutdown", "restart",
+})
+
+_FAST_PATH_MAX_WORDS = 8
+
+
+def is_simple_conversational_turn(text: str) -> bool:
+    """Cheap heuristic: would it be wasteful to run the full intent pipeline
+    and inject the full memory blob into the LLM for this utterance?
+
+    Returns True when the utterance is short (<= 8 words) AND contains none
+    of the command keywords that route to the calendar/file/browser/system
+    handlers. These turns skip intent detection, skip memory context
+    injection, and go straight to a minimal-context LLM call with just the
+    last 3 pairs of conversation history."""
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    words = re.findall(r"[A-Za-z']+", stripped.lower())
+    if not words or len(words) > _FAST_PATH_MAX_WORDS:
+        return False
+    return not any(w in _FAST_PATH_BANNED for w in words)
+
 
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 CLAUSE_RE   = re.compile(r"(?<=[,;:])\s+")
@@ -337,9 +377,45 @@ class VoiceAssistant:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             self.cfg: dict = json.load(f)
 
+        # LLM loads first on the main thread — biggest model, wants Metal's
+        # GPU allocation before the smaller models compete for it. Moondream
+        # warm-up is kicked off from inside _load_llm as a daemon thread,
+        # so it overlaps the parallel block below at no extra cost.
         self._load_llm()
-        self._load_tts()
-        self._load_stt()
+
+        # Parallel load of the three remaining models. On M3 Pro each loads
+        # into its own address space with no cross-dependencies, so wall-time
+        # is bounded by the slowest of the three rather than their sum.
+        timings: dict[str, float] = {}
+
+        def _timed(label: str, fn):
+            def _run():
+                t0 = time.monotonic()
+                try:
+                    fn()
+                except Exception as e:
+                    logger.exception(f"[Startup] {label} load error: {e}")
+                finally:
+                    timings[label] = time.monotonic() - t0
+            return _run
+
+        threads = [
+            threading.Thread(target=_timed("STT", self._load_stt),
+                             name="load-stt", daemon=True),
+            threading.Thread(target=_timed("TTS", self._load_tts),
+                             name="load-tts", daemon=True),
+            threading.Thread(target=_timed("WakeWord", self._load_wake_word_model),
+                             name="load-wake", daemon=True),
+        ]
+        parallel_t0 = time.monotonic()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        parallel_elapsed = time.monotonic() - parallel_t0
+        for label, elapsed in timings.items():
+            logger.info(f"{label} loaded in {elapsed:.2f}s")
+        logger.info(f"Parallel model-load block finished in {parallel_elapsed:.2f}s")
 
         self.vad = webrtcvad.Vad(3)
         self._audio_q: queue.Queue[bytes] = queue.Queue()
@@ -483,10 +559,12 @@ class VoiceAssistant:
         self._llm = Llama(
             model_path=str(model_path),
             n_gpu_layers=c.get("n_gpu_layers", -1),
-            n_ctx=c.get("n_ctx", 4096),
+            n_ctx=c.get("n_ctx", 2048),
             n_threads=c.get("n_threads", 6),
             n_batch=c.get("n_batch", 512),
             f16_kv=c.get("f16_kv", True),
+            use_mmap=c.get("use_mmap", True),
+            use_mlock=c.get("use_mlock", False),
             verbose=False,
         )
         self._llm_cfg = c
@@ -596,6 +674,7 @@ class VoiceAssistant:
         buf        = b""
         silence_ms = 0
         speech_ms  = 0
+        total_ms   = 0   # safety cap — bounded by MAX_RECORDING_MS
         speaking   = False
         # Rolling buffer of recent frames so the first syllable isn't clipped.
         pre_roll: collections.deque[bytes] = collections.deque(maxlen=5)
@@ -653,9 +732,11 @@ class VoiceAssistant:
                 silence_ms = 0
                 speaking   = True
                 speech_ms += FRAME_MS
+                total_ms  += FRAME_MS
             elif speaking:
                 buf        += frame
                 silence_ms += FRAME_MS
+                total_ms   += FRAME_MS
                 # Don't break out while still processing priming frames —
                 # the "silence" might just be a pause between the wake
                 # phrase and the command in the original utterance. Only
@@ -671,6 +752,12 @@ class VoiceAssistant:
             else:
                 # Not speaking yet — keep recent frames for pre-roll
                 pre_roll.append(frame)
+
+            # Hard cap: never record longer than MAX_RECORDING_MS once we've
+            # started capturing speech. Prevents pathological silence-free
+            # audio (background hum, music) from growing the buffer forever.
+            if speaking and total_ms >= MAX_RECORDING_MS:
+                break
         # Check RMS energy — ignore if it's just background noise
         audio_np = np.frombuffer(buf, dtype=np.int16)
         if len(audio_np) == 0:
@@ -1175,18 +1262,24 @@ class VoiceAssistant:
 
     # ── Wake word ─────────────────────────────────────────────────────────────
 
-    def _init_wake_word(self) -> None:
-        """Load the openwakeword model AND start the persistent audio stream.
-
-        The persistent stream feeds self._audio_q continuously from here on.
-        Both wake-word detection and command recording read from the same
-        queue, so there's no stream close/reopen between modes and no gap
-        where single-breath commands can get lost."""
+    def _load_wake_word_model(self) -> None:
+        """Load just the OpenWakeWord model. Safe to call from a background
+        thread — no audio device is touched here."""
         print("[WAKE] Loading hey_jarvis model...", flush=True)
         self._wake_model = WakeWordModel(
             wakeword_models=[WAKE_WORD_MODEL],
             inference_framework='onnx'
         )
+        print("[WAKE] Model loaded.", flush=True)
+
+    def _init_wake_word(self) -> None:
+        """Start the persistent audio stream and mark wake-word listening live.
+        The model itself is loaded earlier in __init__'s parallel block — this
+        only has to bring the mic stream up once everything else is ready."""
+        if self._wake_model is None:
+            # Fallback in case the parallel load block was skipped — keeps
+            # the method self-contained and safe to call on its own.
+            self._load_wake_word_model()
         self._start_persistent_stream()
         print("[WAKE] Ready — listening for 'Hey Jarvis'", flush=True)
 
@@ -4021,18 +4114,38 @@ class VoiceAssistant:
         prompt = prompt + " When the user asks you to remember something, confirm it naturally with a brief phrase like 'Got it, I will keep that in mind' or 'Noted.' Do not repeat the fact back verbatim."
         self.system_prompt = prompt
 
-    def _messages(self) -> list[dict]:
-        max_pairs = self._llm_cfg.get("history_turns", 10)
-        recent    = self.history[-(max_pairs * 2):]
-        return [{"role": "system", "content": self.system_prompt}] + recent
+    def _messages(self, history_pairs: Optional[int] = None,
+                  system_override: Optional[str] = None) -> list[dict]:
+        # Hard cap at 10 pairs regardless of config — keeps every inference
+        # call's input tokens bounded so an old config with history_turns=20
+        # can't silently blow up the context window we just tightened to 2048.
+        if history_pairs is None:
+            history_pairs = self._llm_cfg.get("history_turns", 10)
+        history_pairs = min(history_pairs, 10)
+        recent = self.history[-(history_pairs * 2):] if history_pairs > 0 else []
+        system = system_override if system_override is not None else self.system_prompt
+        return [{"role": "system", "content": system}] + recent
 
-    def stream_sentences(self, user_text: str, memory_context: Optional[str] = None):
+    def stream_sentences(self, user_text: str,
+                         memory_context: Optional[str] = None,
+                         fast: bool = False):
         # Always append the CLEAN user_text to history — never the injected
         # memory context. That's persisted only for this one LLM call.
         self.history.append({"role": "user", "content": user_text})
 
-        messages = self._messages()
-        if memory_context:
+        if fast:
+            # Fast conversational path. Strip memory facts/summaries from the
+            # system prompt (they can cost hundreds of tokens) and use only
+            # the last 3 pairs of history. Caps output at 150 tokens.
+            messages = self._messages(
+                history_pairs=3, system_override=self._base_prompt,
+            )
+            max_new_tokens = 150
+        else:
+            messages = self._messages()
+            max_new_tokens = self._llm_cfg.get("max_new_tokens", 256)
+
+        if memory_context and not fast:
             # Replace the last user message (the one we just appended) with
             # a prefixed version for this one call only. history stays clean.
             prefixed = memory_context + user_text
@@ -4047,7 +4160,7 @@ class VoiceAssistant:
         with self._llm_lock:
             stream = self._llm.create_chat_completion(
                 messages=messages,
-                max_tokens=self._llm_cfg.get("max_new_tokens", 256),
+                max_tokens=max_new_tokens,
                 temperature=self._llm_cfg.get("temperature", 0.7),
                 top_p=self._llm_cfg.get("top_p", 0.9),
                 stop=["<|eot_id|>", "\nUser:", "\nYou:"],
@@ -4084,12 +4197,16 @@ class VoiceAssistant:
 
         self.history.append({"role": "assistant", "content": _clean(full)})
 
-    def handle_turn(self, user_input: str, memory_context: Optional[str] = None) -> None:
+    def handle_turn(self, user_input: str, memory_context: Optional[str] = None,
+                    fast: bool = False) -> None:
         """Three-thread pipeline: LLM → TTS → SeamlessPlayer (zero-gap audio).
 
         memory_context (optional) is a one-turn prefix injected into the LLM
         call for retrieved memory search results. It is NOT saved to history
-        or to the database — only the clean user_input is persisted."""
+        or to the database — only the clean user_input is persisted.
+
+        fast=True enables the lightweight conversational path: base system
+        prompt only, 3 history pairs, 150 max tokens, no memory context."""
         self._cancel_conversation_timer()  # Pause while processing + speaking
         self._stop_speak.clear()
         ws_server.set_state("thinking")
@@ -4103,7 +4220,9 @@ class VoiceAssistant:
         display_lock = threading.Lock()
 
         def _llm() -> None:
-            for chunk in self.stream_sentences(user_input, memory_context=memory_context):
+            for chunk in self.stream_sentences(
+                user_input, memory_context=memory_context, fast=fast,
+            ):
                 sentence_q.put(chunk)
             sentence_q.put(None)
 
@@ -4462,6 +4581,25 @@ class VoiceAssistant:
 
                 # Clipboard augmentation
                 augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
+
+                # Fast conversational path. Short, command-keyword-free
+                # utterances ("how are you?", "tell me a joke") skip the
+                # full intent pipeline AND the memory-context injection, and
+                # use a minimal 3-pair history window. This is the single
+                # biggest win on simple turns — cuts the input-token count
+                # by 5-10x on average, which directly reduces llama-cpp's
+                # prefill time.
+                if (
+                    not is_clipboard
+                    and is_simple_conversational_turn(user_input)
+                ):
+                    print("[Fast] simple conversational turn — skipping intent pipeline")
+                    self.handle_turn(user_input, fast=True)
+                    if self._pending_memory_ack:
+                        self._pending_memory_ack = False
+                        self._speak_memory_ack()
+                    print()
+                    continue
 
                 # System command, calendar intent, file intent, screen
                 # intent, or LLM
