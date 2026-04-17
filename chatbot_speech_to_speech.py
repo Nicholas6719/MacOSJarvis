@@ -2709,14 +2709,38 @@ class VoiceAssistant:
         a dict with query / action / destination / new_name, or None."""
         prompt = (
             "Extract file management details from this voice request. "
-            "Respond in JSON only — no explanation, no markdown. "
-            "Fields: query (the filename or description the user gave), "
-            "action (move/rename/describe/find), "
-            "destination (string or null — where to move it, resolve "
-            "Desktop to /Users/nicholascoppola/Desktop, Documents to "
-            "/Users/nicholascoppola/Documents, Downloads to "
-            "/Users/nicholascoppola/Downloads, etc.), "
-            "new_name (string or null — for rename only). "
+            "Respond in JSON only — no explanation, no markdown.\n\n"
+            "Fields:\n"
+            "- query: JUST the distinctive filename or keyword(s) the "
+            "user mentioned. Short — no filler words like 'file', "
+            "'document', 'the', 'my'. Do NOT include where it is or "
+            "what to do with it. If the user said a full filename, "
+            "use that. Examples: 'resume', 'taxes 2024', "
+            "'rmv-realid-application-steps'.\n"
+            "- action: one of move / rename / describe / find\n"
+            "- destination: a string OR null. Resolve spoken locations "
+            "to absolute paths — Desktop -> /Users/nicholascoppola/Desktop, "
+            "Documents -> /Users/nicholascoppola/Documents, "
+            "Downloads -> /Users/nicholascoppola/Downloads, "
+            "Pictures -> /Users/nicholascoppola/Pictures, "
+            "Music -> /Users/nicholascoppola/Music. "
+            "For anything that isn't a move, set this to null.\n"
+            "- new_name: string OR null. Only set when the user is "
+            "renaming the file; otherwise null.\n\n"
+            "Examples:\n"
+            "  'move the rmv file from my desktop to my documents folder' -> "
+            "{\"query\": \"rmv\", \"action\": \"move\", "
+            "\"destination\": \"/Users/nicholascoppola/Documents\", "
+            "\"new_name\": null}\n"
+            "  'rename the groceries file to shopping list' -> "
+            "{\"query\": \"groceries\", \"action\": \"rename\", "
+            "\"destination\": null, \"new_name\": \"shopping list\"}\n"
+            "  'find my resume' -> "
+            "{\"query\": \"resume\", \"action\": \"find\", "
+            "\"destination\": null, \"new_name\": null}\n"
+            "  'what is in my notes file' -> "
+            "{\"query\": \"notes\", \"action\": \"describe\", "
+            "\"destination\": null, \"new_name\": null}\n\n"
             f"User said: '{utterance}'"
         )
         raw = self._llm_silent(
@@ -2769,6 +2793,7 @@ class VoiceAssistant:
         Any exception is caught and spoken so the pipeline never crashes."""
         try:
             data = self._extract_file_json(user_input) or {}
+            print(f"[File] extract -> {data}")
             query = (data.get("query") or "").strip()
             destination = data.get("destination")
             new_name = data.get("new_name")
@@ -2782,7 +2807,11 @@ class VoiceAssistant:
                     flags=re.IGNORECASE,
                 ).strip()
 
+            print(f"[File] search query={query!r}")
             matches = file_manager.search_file(query)
+            print(f"[File] matches={len(matches)}")
+            for m in matches:
+                print(f"[File]   - {m}")
             if not matches:
                 self.speak_direct(
                     "I couldn't find anything matching that, Sir. "
@@ -2804,6 +2833,8 @@ class VoiceAssistant:
                 file_manager.resolve_destination(destination)
                 if action == "move" else None
             )
+            print(f"[File] action={action} destination={destination!r} "
+                  f"resolved={resolved_dest!r} new_name={new_name!r}")
 
             if action == "move" and not resolved_dest:
                 self.speak_direct(

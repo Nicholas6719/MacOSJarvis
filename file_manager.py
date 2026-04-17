@@ -17,6 +17,7 @@ Public surface:
 """
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -96,25 +97,46 @@ def _is_excluded(path: str) -> bool:
     return False
 
 
-def search_file(query: str) -> list[str]:
-    """Search the Mac by filename via mdfind. Returns up to 5 user-relevant
-    matches sorted most-recently-modified first."""
-    q = (query or "").strip()
-    if not q:
-        return []
+# Words the LLM often drags into the extracted "query" that aren't part of
+# the actual filename. We strip them when tokenizing so a messy query like
+# "rmv file from my desktop" still finds RMV-RealID-Application-Steps.png.
+_QUERY_STOPWORDS = {
+    "a", "an", "the", "my", "your", "our", "their", "this", "that", "these",
+    "those", "from", "to", "in", "on", "into", "onto", "at", "with", "please",
+    "jarvis", "file", "files", "document", "doc", "docs",
+    "folder", "directory", "called", "named", "titled", "image", "images",
+    "picture", "photo", "and", "or", "of", "for",
+    "me", "us", "is", "it", "some", "any", "all", "pdf",
+    # Location words — the user is pointing to a folder, not naming
+    # the file. Without these, "rmv file from my desktop" would match
+    # any path containing "desktop".
+    "desktop", "downloads", "download", "documents", "pictures", "photos",
+    "music", "movies", "videos", "home", "trash", "icloud",
+    # Common action/relational verbs that creep into the extracted
+    # query when the LLM includes too much of the utterance.
+    "move", "rename", "find", "locate", "summarize", "summarise",
+    "describe", "read", "open", "put", "send", "transfer",
+}
 
+
+def _run_mdfind(args: list[str]) -> list[str]:
     try:
         result = subprocess.run(
-            ["mdfind", "-name", q],
+            args,
             capture_output=True,
             text=True,
             timeout=8,
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"[file_manager] mdfind failed: {e}")
         return []
+    except Exception as e:
+        print(f"[file_manager] mdfind error: {e}")
+        return []
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
-    raw = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+def _filter_and_rank(raw: list[str]) -> list[str]:
     candidates: list[tuple[float, str]] = []
     for path in raw:
         if _is_excluded(path):
@@ -124,9 +146,61 @@ def search_file(query: str) -> list[str]:
         except OSError:
             continue
         candidates.append((mtime, path))
-
     candidates.sort(key=lambda x: x[0], reverse=True)
     return [path for _, path in candidates[:5]]
+
+
+def _tokenize_query(q: str) -> list[str]:
+    """Strip filler words and punctuation, keep tokens ≥2 chars."""
+    tokens = [t for t in re.split(r"[^A-Za-z0-9]+", q.lower()) if t]
+    return [t for t in tokens if len(t) >= 2 and t not in _QUERY_STOPWORDS]
+
+
+def search_file(query: str) -> list[str]:
+    """Search the Mac by filename via mdfind. Returns up to 5 user-relevant
+    matches sorted most-recently-modified first.
+
+    Strategy — try progressively looser queries so messy LLM-extracted
+    strings still find real files:
+      1. literal substring:   `mdfind -name "<q>"`
+      2. AND query on all tokens (stopwords stripped) via kMDItemFSName
+      3. per-token search, first hit wins
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    print(f"[file_manager] search_file query={q!r}")
+
+    # Pass 1 — literal substring match on the whole query.
+    raw = _run_mdfind(["mdfind", "-name", q])
+    ranked = _filter_and_rank(raw)
+    if ranked:
+        print(f"[file_manager] pass-1 matches={len(ranked)}")
+        return ranked
+
+    # Pass 2 — tokenize, keep distinctive words, AND them together.
+    tokens = _tokenize_query(q)
+    if tokens:
+        and_query = " && ".join(f'kMDItemFSName == "*{t}*"cd' for t in tokens)
+        raw = _run_mdfind(["mdfind", and_query])
+        ranked = _filter_and_rank(raw)
+        if ranked:
+            print(f"[file_manager] pass-2 tokens={tokens} matches={len(ranked)}")
+            return ranked
+
+        # Pass 3 — last resort, try each token alone (most distinctive first,
+        # rough heuristic: longer tokens are more distinctive). Take the
+        # first token that yields any hits.
+        for t in sorted(set(tokens), key=len, reverse=True):
+            raw = _run_mdfind(["mdfind", "-name", t])
+            ranked = _filter_and_rank(raw)
+            if ranked:
+                print(f"[file_manager] pass-3 token={t!r} matches={len(ranked)}")
+                return ranked
+
+    print("[file_manager] no matches")
+    return []
 
 
 # ── File type ─────────────────────────────────────────────────────────────────
