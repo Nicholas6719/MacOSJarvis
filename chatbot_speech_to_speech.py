@@ -475,6 +475,11 @@ class VoiceAssistant:
         self._llm_cfg = c
         print("[LLM] Ready  (Metal GPU layers active)")
 
+        # Warm Moondream 2 in the background so the first "what's on my
+        # screen" call doesn't pay the model-load cost. Fire-and-forget —
+        # if it fails, the lazy load in _screen_worker_body still runs.
+        screen_awareness.warm_up_in_background()
+
     def _load_tts(self) -> None:
         from kokoro_onnx import Kokoro
 
@@ -3151,12 +3156,13 @@ class VoiceAssistant:
             if orb_mode:
                 self._push_screen_preview()
 
-            # Warn the user if we're about to trigger a first-run download.
+            # Warn the user if we're about to trigger a first-run download
+            # or the warm-up hasn't finished loading the model yet.
             try:
-                from screen_awareness import (
-                    _MOONDREAM_CACHE_DIR, _MOONDREAM_MODEL_FILENAME,
+                model_file = (
+                    screen_awareness._MOONDREAM_CACHE_DIR
+                    / screen_awareness._MOONDREAM_MODEL_FILENAME
                 )
-                model_file = _MOONDREAM_CACHE_DIR / _MOONDREAM_MODEL_FILENAME
                 first_run = not model_file.is_file()
             except Exception:
                 first_run = False
