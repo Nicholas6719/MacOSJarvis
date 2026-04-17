@@ -121,6 +121,63 @@ struct WKWebViewRepresentable: NSViewRepresentable {
     /// Callback so AppDelegate can store a reference to the WKWebView for forced reloads.
     var onWebViewCreated: ((JarvisWebView) -> Void)?
 
+    /// Inline HTML shown immediately while the Python backend is still
+    /// loading its LLM / TTS / STT models (typically 15-25 seconds). Without
+    /// this, the WebView would sit on a blank / failed-connection state
+    /// during startup and the user couldn't tell Jarvis was actually
+    /// coming up. When the localhost:3000 load eventually succeeds, the
+    /// WebView navigates to it and replaces this page.
+    private static let loadingHTML: String = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>Jarvis</title>
+        <style>
+            html, body {
+                margin: 0;
+                padding: 0;
+                height: 100%;
+                background: #000;
+                color: #aaa;
+                font-family: -apple-system, "SF Pro Text", system-ui, sans-serif;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .stage { text-align: center; }
+            .dot {
+                display: inline-block;
+                width: 10px;
+                height: 10px;
+                margin: 0 4px;
+                background: #6ab;
+                border-radius: 50%;
+                animation: pulse 1.4s infinite ease-in-out both;
+            }
+            .dot:nth-child(2) { animation-delay: 0.2s; }
+            .dot:nth-child(3) { animation-delay: 0.4s; }
+            @keyframes pulse {
+                0%, 80%, 100% { transform: scale(0.3); opacity: 0.3; }
+                40% { transform: scale(1.0); opacity: 1; }
+            }
+            .label {
+                margin-top: 20px;
+                font-size: 13px;
+                letter-spacing: 0.5px;
+                opacity: 0.7;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="stage">
+            <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+            <div class="label">Starting Jarvis…</div>
+        </div>
+    </body>
+    </html>
+    """
+
     func makeNSView(context: Context) -> JarvisWebView {
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
@@ -129,8 +186,18 @@ struct WKWebViewRepresentable: NSViewRepresentable {
         webView.navigationDelegate = context.coordinator
         webView.allowsMagnification = false
 
-        if let url = URL(string: "http://localhost:3000") {
-            webView.load(URLRequest(url: url))
+        // Show the loading placeholder IMMEDIATELY. This load succeeds
+        // synchronously because it's a data URL — no network required.
+        webView.loadHTMLString(Self.loadingHTML, baseURL: nil)
+
+        // Attempt to load the real UI after a short delay so the loading
+        // page has time to render. If Python isn't ready yet, the
+        // coordinator's failure handler retries every 2s and WebKit
+        // keeps the current (loading) page visible between attempts.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            if let url = URL(string: "http://localhost:3000") {
+                webView.load(URLRequest(url: url))
+            }
         }
 
         onWebViewCreated?(webView)

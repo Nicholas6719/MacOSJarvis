@@ -1677,20 +1677,41 @@ class VoiceAssistant:
         return today
 
     def _parse_time(self, t: Optional[str]) -> Optional[tuple]:
-        """Parse HH:MM (24h) into (hour, minute)."""
+        """Parse a time string into (hour, minute) in 24-hour form.
+
+        Accepts a pile of formats the LLM might return: '09:00', '9:00',
+        '9:00 AM', '9 AM', '9am', '9 pm', '21:00'. The previous version
+        only accepted '09:00' / '9:00' — when the LLM returned anything
+        with AM/PM, parsing silently returned None and the reminder's
+        new due time never got set. Nicholas's 'reschedule to Sunday at
+        9 AM' was almost certainly hitting this."""
         if not t:
             return None
-        s = str(t).strip()
-        m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+        s = str(t).strip().lower()
+        # Track AM/PM markers. Use suffix-match instead of \b word boundary
+        # because "9pm" has no word boundary between the digit and the 'p'.
+        s_stripped_dot = s.replace(".", "")
+        is_pm = s_stripped_dot.endswith("pm") or s_stripped_dot.endswith(" pm")
+        is_am = s_stripped_dot.endswith("am") or s_stripped_dot.endswith(" am")
+        # Strip the marker (with or without dots, with or without leading space).
+        s = re.sub(r"\s*[ap]\.?m\.?\s*$", "", s).strip()
+        # Match HH or HH:MM or HH.MM
+        m = re.match(r"^(\d{1,2})(?:[.:](\d{2}))?$", s)
         if not m:
             return None
         try:
-            h, mi = int(m.group(1)), int(m.group(2))
-            if 0 <= h <= 23 and 0 <= mi <= 59:
-                return (h, mi)
+            h = int(m.group(1))
+            mi = int(m.group(2)) if m.group(2) else 0
+            if not (0 <= h <= 23 and 0 <= mi <= 59):
+                return None
+            # Fold AM/PM into 24-hour.
+            if is_pm and h < 12:
+                h += 12
+            elif is_am and h == 12:
+                h = 0
+            return (h, mi)
         except Exception:
-            pass
-        return None
+            return None
 
     # ── Memory-backed location lookup ──────────────────────────────────────
 
@@ -2256,6 +2277,7 @@ class VoiceAssistant:
         event extractor) so the user's identifier for the reminder doesn't
         get mistakenly interpreted as a new title."""
         hint = self._extract_target_hint(user_input)
+        print(f"[Calendar] update_reminder hint={hint!r}")
         if not hint:
             self._safe_speak(
                 "Which reminder would you like me to update, Sir?"
@@ -2263,6 +2285,7 @@ class VoiceAssistant:
             return
 
         data_json = self._extract_update_json(user_input) or {}
+        print(f"[Calendar] update_reminder LLM extraction: {data_json!r}")
 
         # Sanitize string fields — LLM sometimes returns "null" string
         def _clean_optional(value):
@@ -2273,23 +2296,35 @@ class VoiceAssistant:
                 return None
             return s
 
-        new_title = _clean_optional(data_json.get("new_title"))
-        new_date_field = _clean_optional(data_json.get("new_date"))
-        new_time_field = _clean_optional(data_json.get("new_time"))
-        new_notes = _clean_optional(data_json.get("new_notes"))
+        def _pick(*names):
+            """Look up a value under any of several possible field names.
+            The LLM doesn't always honor the `new_` prefix we asked for."""
+            for n in names:
+                v = data_json.get(n)
+                if v is not None:
+                    cleaned = _clean_optional(v)
+                    if cleaned is not None:
+                        return cleaned
+            return None
+
+        # Be tolerant of common alternate field names the LLM might use.
+        new_title = _pick("new_title", "title", "rename_to", "name")
+        new_date_field = _pick("new_date", "date", "due_date")
+        new_time_field = _pick(
+            "new_time", "time", "due_time", "start_time", "at_time"
+        )
+        new_notes = _pick("new_notes", "notes", "note", "body")
 
         # Safety net: if the LLM disobeyed and put the hint into new_title,
         # reject it. An exact-lower-case match with the identifier is never
         # a real rename.
         if new_title and new_title.lower().strip() == hint.lower().strip():
+            print(f"[Calendar] nulling new_title (matches hint): {new_title!r}")
             new_title = None
 
         # Build the new due datetime. The user might change date only,
-        # time only, or both. If they change only one, keep the other
-        # from the existing reminder if possible — but we don't have
-        # easy access to the existing reminder's fields from here, so
-        # we use current date as fallback for missing time, and current
-        # time as fallback for missing date.
+        # time only, or both. If only date or only time, use today or 9 AM
+        # as a sensible default for the missing half.
         new_due: Optional[datetime.datetime] = None
         if new_date_field or new_time_field:
             if new_date_field:
@@ -2297,16 +2332,20 @@ class VoiceAssistant:
             else:
                 resolved_date = datetime.date.today()
             parsed_time = self._parse_time(new_time_field)
-            if parsed_time is None and new_time_field is None:
-                # No time specified and no date specified — can't happen
-                # because the outer if guarantees one of them exists.
-                parsed_time = (9, 0)
-            elif parsed_time is None:
-                # Date-only reschedule — default to 9:00 AM.
+            if parsed_time is None:
+                # Either time wasn't provided, or _parse_time couldn't
+                # handle the format. Default to 9 AM.
                 parsed_time = (9, 0)
             new_due = datetime.datetime.combine(
                 resolved_date, datetime.time(parsed_time[0], parsed_time[1])
             )
+
+        print(
+            f"[Calendar] update_reminder parsed: "
+            f"new_title={new_title!r}, new_date={new_date_field!r}, "
+            f"new_time={new_time_field!r}, new_due={new_due!r}, "
+            f"new_notes={new_notes!r}"
+        )
 
         if new_title is None and new_due is None and new_notes is None:
             self._safe_speak(
@@ -2319,6 +2358,7 @@ class VoiceAssistant:
         success, msg = calendar_reminders.update_reminder(
             hint, new_title=new_title, new_due=new_due, new_notes=new_notes,
         )
+        print(f"[Calendar] update_reminder result: success={success}, msg={msg!r}")
         if not success:
             self._safe_speak(
                 f"I couldn't find a reminder matching {hint!r}, Sir."
