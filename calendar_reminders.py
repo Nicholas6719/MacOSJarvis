@@ -790,11 +790,17 @@ def _find_best_event(
     if store is None:
         store = _EK.EKEventStore.alloc().init()
 
-    # Define the search window
+    # Define the search window. When the user named a specific day, we
+    # search EXACTLY that day (00:00 to 24:00 local). Previously we used
+    # a ±2 day window, which caused "delete the Monday work event" to
+    # also match a Saturday "Work" event when both had identical titles —
+    # the fuzzy title scores tied and the first-seen event (Saturday) won.
+    # Single-day window prevents this by physically excluding neighbouring
+    # days from the candidate set.
     if date_hint is not None:
         anchor = datetime.datetime.combine(date_hint, datetime.time(0, 0, 0))
-        start_dt = anchor - datetime.timedelta(days=2)
-        end_dt = anchor + datetime.timedelta(days=2)
+        start_dt = anchor
+        end_dt = anchor + datetime.timedelta(days=1)
     else:
         start_dt = datetime.datetime.now() - datetime.timedelta(days=2)
         end_dt = datetime.datetime.now() + datetime.timedelta(days=window_days)

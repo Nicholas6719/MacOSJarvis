@@ -1482,7 +1482,8 @@ class VoiceAssistant:
            re.search(
                r"\b(?:reschedule|move)\b[^.?!]{2,60}?\bto\b[^.?!]{0,30}?" + _DATE_OR_TIME_SUFFIX,
                t,
-           ):
+           ) or \
+           re.search(r"\brename\s+(?:the\s+)?[^.?!]{2,60}?\s+to\s+[^.?!]{2,}", t):
             return "update_reminder"
 
         # Delete a calendar event.
@@ -1896,15 +1897,30 @@ class VoiceAssistant:
             "These are the events on my calendar between now and the end of "
             "this coming Saturday. Summarize them naturally and conversationally "
             "in Jarvis's voice — not a list, not a script, just how a sharp "
-            "assistant would say it out loud. Group related items and mention "
-            "days, not full dates. Keep it to three to five sentences.\n\n"
+            "assistant would say it out loud.\n\n"
+            "CRITICAL RULES:\n"
+            "- Read the day of week for each event EXACTLY as given in the "
+            "input. If the input says Saturday, say Saturday — do NOT say "
+            "Wednesday or Monday or any other day.\n"
+            "- Read each time EXACTLY as written. Do not change AM to PM.\n"
+            "- Do not invent events that aren't in the input.\n"
+            "- Keep it to three to five sentences.\n\n"
             + "\n".join(lines)
         )
         text = self._llm_silent(self._JARVIS_CAL_SYSTEM, prompt, max_tokens=260)
         if text:
             self._safe_speak(text)
         else:
-            self._safe_speak("I had trouble summarizing your week, Sir.")
+            # Deterministic template fallback — never hallucinates days/times.
+            parts = [f"You have {len(events)} event" + ("s" if len(events) != 1 else "") + " this week, Sir."]
+            for e in events:
+                segment = e.get("title", "Untitled")
+                if e.get("start"):
+                    segment += f" on {e['start']}"
+                if e.get("location"):
+                    segment += f" at {e['location']}"
+                parts.append(segment + ".")
+            self._safe_speak(" ".join(parts))
 
     def _cal_read_reminders(self) -> None:
         reminders = calendar_reminders.get_all_reminders()
@@ -2267,6 +2283,10 @@ class VoiceAssistant:
     # Words that appear in the intent verb or surrounding phrasing and should
     # be stripped before we use the remaining text as a fuzzy match target.
     _TITLE_STRIP_VERBS = (
+        # STT mishears the wake word inside utterances — e.g. "Jervis please
+        # delete..." — strip those variants so they don't leak into the
+        # fuzzy match and throw off scoring.
+        "jarvis", "jervis", "jarvus", "jarbis", "jarves", "javis", "jovis",
         "can you", "could you", "please", "would you",
         "complete", "completed", "finish", "finished", "mark",
         "check off", "check",
@@ -2288,10 +2308,22 @@ class VoiceAssistant:
         # Strip command-verb / filler phrases
         for phrase in self._TITLE_STRIP_VERBS:
             t = re.sub(r"\s" + re.escape(phrase) + r"\s", " ", t)
-        # Strip trailing time / date qualifiers
+        # Strip trailing time-phrase qualifiers AND everything after (they're
+        # always at the end). Intentionally does NOT cover bare weekdays
+        # because the weekday can appear MID-sentence before the title —
+        # e.g. "delete the Monday work event" where "work event" is the
+        # real title. Using `.*` on weekdays ate the title in an earlier
+        # version of this code.
         t = re.sub(
-            r"\s+(?:for\s+)?(?:today|tomorrow|tonight|this\s+(?:morning|afternoon|evening|week)|next\s+\w+|"
-            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b.*",
+            r"\s+(?:for\s+)?(?:today|tomorrow|tonight|"
+            r"this\s+(?:morning|afternoon|evening|week)|next\s+\w+)\b.*",
+            " ", t,
+        )
+        # Strip bare weekday names without eating surrounding text. Delete
+        # handlers extract the weekday separately via their own regex and
+        # pass it as a date_hint, so we don't need it in the fuzzy hint.
+        t = re.sub(
+            r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
             " ", t,
         )
         t = re.sub(r"\s+at\s+\d[\w:.\s]*", " ", t)
@@ -2408,10 +2440,27 @@ class VoiceAssistant:
         )
         new_notes = _pick("new_notes", "notes", "note", "body")
 
-        # Safety net: if the LLM disobeyed and put the hint into new_title,
-        # reject it. An exact-lower-case match with the identifier is never
-        # a real rename.
-        if new_title and new_title.lower().strip() == hint.lower().strip():
+        # Safety net: only accept new_title if the user's utterance
+        # contains an EXPLICIT rename verb. Without this check, the LLM
+        # often invents a new title during reschedule operations — e.g.
+        # Nicholas said "pick up groceries reminder to Sunday at 10 AM"
+        # (no rename verb) and the LLM still returned new_title='Grocery'.
+        # A real rename would have gone through the rename fast-path above,
+        # so if we're here and there's no rename/call-it/retitle verb,
+        # any title the LLM returned is hallucinated.
+        _user_lower = user_input.lower()
+        _has_rename_verb = bool(re.search(
+            r"\b(?:rename|re[-\s]?title|call\s+it|change\s+(?:the\s+)?(?:name|title))\b",
+            _user_lower,
+        ))
+        if new_title and not _has_rename_verb:
+            print(
+                f"[Calendar] nulling new_title (no rename verb in utterance): "
+                f"{new_title!r}"
+            )
+            new_title = None
+        elif new_title and new_title.lower().strip() == hint.lower().strip():
+            # Original safety net kept for the rename-but-title-matches-hint edge
             print(f"[Calendar] nulling new_title (matches hint): {new_title!r}")
             new_title = None
 
@@ -2475,11 +2524,24 @@ class VoiceAssistant:
             return
 
         # If the user named a day, narrow the event search window.
-        data_json = self._extract_event_json(user_input) or {}
+        # Direct regex extraction (not LLM) — fast, deterministic, and
+        # always respects the user's explicit day. Without this, a
+        # "delete the Monday work event" command could match a Saturday
+        # "Work" event if the LLM fails to extract the weekday via the
+        # event-creation prompt (which was the Saturday-deleted bug).
         date_hint: Optional[datetime.date] = None
-        if data_json.get("date"):
+        _day_match = re.search(
+            r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+            r"tomorrow|today|tonight)\b",
+            user_input.lower(),
+        )
+        if _day_match:
             try:
-                date_hint = self._resolve_relative_date(str(data_json["date"]))
+                date_hint = self._resolve_relative_date(_day_match.group(1))
+                print(
+                    f"[Calendar] delete_event: regex-extracted day "
+                    f"{_day_match.group(1)!r} -> {date_hint}"
+                )
             except Exception:
                 date_hint = None
 
