@@ -1444,6 +1444,31 @@ class VoiceAssistant:
            re.search(r"\bremind\s+me\s+to\b", t):
             return "create_reminder"
 
+        # Complete a reminder. MUST come before delete_reminder because
+        # "complete" is a distinct verb. Matches "complete/finish/mark-
+        # as-done X reminder" etc. Also matches "check off X".
+        if re.search(r"\b(?:complete|finish|check\s+off|mark\s+(?:as\s+)?(?:done|complete|completed|finished))\b[^.?!]*\breminder\b", t) or \
+           re.search(r"\b(?:complete|finish|check\s+off)\s+(?:the\s+)?reminder\b", t) or \
+           re.search(r"\b(?:mark|flag)\s+(?:the\s+)?.+?\s+(?:as\s+)?(?:done|completed|complete|finished)\b", t) or \
+           re.search(r"\breminder\s+(?:is\s+)?(?:done|completed|complete)\b", t):
+            return "complete_reminder"
+
+        # Delete a reminder.
+        if re.search(r"\b(?:delete|remove|cancel|drop|get\s+rid\s+of|throw\s+out)\s+(?:the\s+)?[^.?!]*?\breminder\b", t) or \
+           re.search(r"\breminder\s+(?:for\s+[^.?!]*?\s+)?(?:is\s+)?(?:gone|cancelled|canceled|no\s+longer\s+needed)\b", t):
+            return "delete_reminder"
+
+        # Update a reminder — reschedule, rename, change notes.
+        if re.search(r"\b(?:reschedule|move|change|update|edit|rename)\s+(?:the\s+)?[^.?!]*?\breminder\b", t) or \
+           re.search(r"\b(?:change|update|move)\s+(?:the\s+)?reminder\b", t):
+            return "update_reminder"
+
+        # Delete a calendar event.
+        if re.search(r"\b(?:delete|remove|cancel|drop)\s+(?:the\s+)?[^.?!]*?\b(?:event|meeting|appointment|shift)\b", t) or \
+           re.search(r"\b(?:cancel|remove|delete)\s+[^.?!]*?\s+from\s+(?:my\s+)?calendar\b", t) or \
+           re.search(r"\b(?:take|get)\s+[^.?!]*?\s+off\s+(?:my\s+)?calendar\b", t):
+            return "delete_event"
+
         # Create calendar event. STRICT: must include calendar/event/meeting/
         # appointment as a clear command target. No soft triggers.
         if re.search(r"\b(?:add|schedule|put|create|book)\b[^.?!]{0,40}\b(?:to|on|in|for)\s+(?:my\s+)?calendar\b", t) or \
@@ -1674,6 +1699,14 @@ class VoiceAssistant:
                 self._cal_create_event(user_input)
             elif intent == "create_reminder":
                 self._cal_create_reminder(user_input)
+            elif intent == "complete_reminder":
+                self._cal_complete_reminder(user_input)
+            elif intent == "delete_reminder":
+                self._cal_delete_reminder(user_input)
+            elif intent == "update_reminder":
+                self._cal_update_reminder(user_input)
+            elif intent == "delete_event":
+                self._cal_delete_event(user_input)
             else:
                 print(f"[Calendar] unknown intent: {intent!r}")
         except RuntimeError as e:
@@ -2084,6 +2117,155 @@ class VoiceAssistant:
         else:
             text = f"Done, Sir. I've added a reminder to {title}."
         self._safe_speak(text)
+
+    # ── Edit / delete / complete handlers ──────────────────────────────────
+
+    # Words that appear in the intent verb or surrounding phrasing and should
+    # be stripped before we use the remaining text as a fuzzy match target.
+    _TITLE_STRIP_VERBS = (
+        "can you", "could you", "please", "would you",
+        "complete", "completed", "finish", "finished", "mark",
+        "check off", "check",
+        "delete", "deleting", "remove", "removing", "cancel", "cancelling",
+        "canceled", "cancelled", "drop", "get rid of", "throw out", "dismiss",
+        "reschedule", "move", "change", "update", "edit", "rename",
+        "the", "my", "a", "an", "that", "this",
+        "for me", "as done", "as complete", "as completed", "as finished",
+        "reminder", "event", "meeting", "appointment", "shift",
+        "from my calendar", "off my calendar", "on my calendar",
+    )
+
+    def _extract_target_hint(self, user_input: str) -> str:
+        """Return the 'payload' of an edit/delete/complete command with the
+        verb words and item-type words stripped away.
+        "complete the Amazon smartwatch reminder for today at 10 a.m." ->
+        "Amazon smartwatch"."""
+        t = " " + user_input.lower().strip() + " "
+        # Strip command-verb / filler phrases
+        for phrase in self._TITLE_STRIP_VERBS:
+            t = re.sub(r"\s" + re.escape(phrase) + r"\s", " ", t)
+        # Strip trailing time / date qualifiers
+        t = re.sub(
+            r"\s+(?:for\s+)?(?:today|tomorrow|tonight|this\s+(?:morning|afternoon|evening|week)|next\s+\w+|"
+            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b.*",
+            " ", t,
+        )
+        t = re.sub(r"\s+at\s+\d[\w:.\s]*", " ", t)
+        t = re.sub(r"\s+from\s+\d[\w:.\s]*", " ", t)
+        # Collapse whitespace + trim stray punctuation
+        t = re.sub(r"[^\w\s'-]", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    def _cal_complete_reminder(self, user_input: str) -> None:
+        hint = self._extract_target_hint(user_input)
+        if not hint:
+            self._safe_speak("Which reminder would you like me to complete, Sir?")
+            return
+        success, msg = calendar_reminders.complete_reminder(hint)
+        if success:
+            self._safe_speak(f"Done, Sir. I've completed the {msg} reminder.")
+        else:
+            self._safe_speak(
+                f"I couldn't find a reminder matching {hint!r}, Sir."
+            )
+
+    def _cal_delete_reminder(self, user_input: str) -> None:
+        hint = self._extract_target_hint(user_input)
+        if not hint:
+            self._safe_speak("Which reminder would you like me to delete, Sir?")
+            return
+        success, msg = calendar_reminders.delete_reminder(hint)
+        if success:
+            self._safe_speak(f"Deleted the {msg} reminder, Sir.")
+        else:
+            self._safe_speak(
+                f"I couldn't find a reminder matching {hint!r}, Sir."
+            )
+
+    def _cal_update_reminder(self, user_input: str) -> None:
+        """Update a reminder's title, due date/time, or notes via voice.
+        Extracts new values from the utterance via the LLM, then applies
+        them to the best-matching open reminder."""
+        hint = self._extract_target_hint(user_input)
+        if not hint:
+            self._safe_speak(
+                "Which reminder would you like me to update, Sir?"
+            )
+            return
+
+        # Reuse the event-extraction LLM to pull new field values out of the
+        # user's request. Not every field has to be present — we only apply
+        # the ones that came back non-null.
+        data_json = self._extract_event_json(user_input) or {}
+        new_title = None
+        raw_title = data_json.get("title")
+        # Only use the extracted title if it's clearly different from our
+        # fuzzy-hint (which is the OLD title). Otherwise the LLM probably
+        # just echoed the hint back.
+        if isinstance(raw_title, str) and raw_title.strip() and \
+           raw_title.strip().lower() != hint.lower():
+            new_title = raw_title.strip()
+
+        new_due: Optional[datetime.datetime] = None
+        date_field = data_json.get("date")
+        start_time = data_json.get("start_time")
+        if date_field or start_time:
+            resolved = self._resolve_relative_date(str(date_field or "today"))
+            st = self._parse_time(start_time) or (9, 0)
+            new_due = datetime.datetime.combine(
+                resolved, datetime.time(st[0], st[1])
+            )
+
+        if new_title is None and new_due is None:
+            self._safe_speak(
+                "I heard you wanted to update a reminder, Sir, but I "
+                "didn't catch what to change. Try saying for example, "
+                "'reschedule the groceries reminder to tomorrow at 6 PM'."
+            )
+            return
+
+        success, msg = calendar_reminders.update_reminder(
+            hint, new_title=new_title, new_due=new_due
+        )
+        if not success:
+            self._safe_speak(
+                f"I couldn't find a reminder matching {hint!r}, Sir."
+            )
+            return
+
+        parts = [f"Updated the {msg} reminder"]
+        if new_title:
+            parts.append(f"— renamed to {new_title}")
+        if new_due:
+            when = calendar_reminders.format_datetime_for_speech(new_due)
+            parts.append(f"— due {when}")
+        self._safe_speak(" ".join(parts) + ", Sir.")
+
+    def _cal_delete_event(self, user_input: str) -> None:
+        hint = self._extract_target_hint(user_input)
+        if not hint:
+            self._safe_speak("Which event would you like me to delete, Sir?")
+            return
+
+        # If the user named a day, narrow the event search window.
+        data_json = self._extract_event_json(user_input) or {}
+        date_hint: Optional[datetime.date] = None
+        if data_json.get("date"):
+            try:
+                date_hint = self._resolve_relative_date(str(data_json["date"]))
+            except Exception:
+                date_hint = None
+
+        success, msg = calendar_reminders.delete_calendar_event(
+            hint, date_hint=date_hint
+        )
+        if success:
+            self._safe_speak(f"Deleted the {msg} event from your calendar, Sir.")
+        else:
+            self._safe_speak(
+                f"I couldn't find an event matching {hint!r}, Sir."
+            )
 
     # ── Pending clarification resume ────────────────────────────────────────
 

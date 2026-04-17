@@ -15,6 +15,7 @@ failure propagate into the main voice pipeline.
 """
 
 import datetime
+import re
 import subprocess
 import threading
 import time
@@ -573,3 +574,243 @@ def classify_calendar(user_text: str) -> str:
     if chosen in available:
         return chosen
     return available[0]
+
+
+# ── Edit / delete / complete operations (EventKit-backed) ─────────────────────
+#
+# All mutations return a 2-tuple: (success: bool, matched_title_or_error: str).
+# The matched title (on success) is what the callers speak back to the user
+# so they can confirm we acted on the right item. Failures return a short
+# human-readable error string.
+#
+# Target items are found by fuzzy title match — users won't repeat exact
+# titles out loud, so we take a title HINT ("Amazon smartwatch") and find
+# the best match among open reminders / upcoming events ("Contact Amazon
+# smart watch refund").
+
+
+def _fuzzy_match_score(query: str, candidate: str) -> float:
+    """Return 0.0 to 1.0 — fraction of significant query words that appear
+    inside the candidate title. Space-insensitive: 'smartwatch' matches
+    'smart watch'. Words shorter than 3 characters are ignored so filler
+    like 'the', 'my', 'a' doesn't dilute the score."""
+    if not query or not candidate:
+        return 0.0
+    q_words = [w for w in re.findall(r"\w+", query.lower()) if len(w) > 2]
+    if not q_words:
+        return 0.0
+    c_lower = candidate.lower()
+    c_nospace = c_lower.replace(" ", "")
+    matches = 0
+    for w in q_words:
+        if w in c_lower or w in c_nospace:
+            matches += 1
+    return matches / len(q_words)
+
+
+def _find_best_reminder(title_hint: str, store=None):
+    """Fetch incomplete reminders via EventKit, return the EKReminder whose
+    title best matches title_hint. Returns None if nothing scores above 0.5."""
+    if not _EK_AVAILABLE:
+        return None
+    if store is None:
+        store = _EK.EKEventStore.alloc().init()
+
+    predicate = store.predicateForIncompleteRemindersWithDueDateStarting_ending_calendars_(
+        None, None, None
+    )
+    result = {"reminders": None, "done": threading.Event()}
+
+    def _completion(reminders):
+        try:
+            result["reminders"] = list(reminders) if reminders else []
+        except Exception:
+            result["reminders"] = []
+        finally:
+            result["done"].set()
+
+    store.fetchRemindersMatchingPredicate_completion_(predicate, _completion)
+    if not result["done"].wait(timeout=10):
+        return None
+
+    best_score = 0.0
+    best = None
+    for r in result["reminders"] or []:
+        try:
+            title = r.title() or ""
+        except Exception:
+            title = ""
+        score = _fuzzy_match_score(title_hint, title)
+        if score > best_score:
+            best_score = score
+            best = r
+    return best if best_score >= 0.5 else None
+
+
+def complete_reminder(title_hint: str) -> tuple:
+    """Find and mark-complete the incomplete reminder best matching title_hint.
+    Returns (True, matched_title) on success, (False, error_message) otherwise.
+    EventKit-based — a full marker-complete operation takes <0.2 seconds."""
+    if not _EK_AVAILABLE:
+        return (False, "EventKit is not available")
+    store = _EK.EKEventStore.alloc().init()
+    reminder = _find_best_reminder(title_hint, store=store)
+    if reminder is None:
+        return (False, f"no open reminder matches {title_hint!r}")
+
+    try:
+        title = reminder.title() or title_hint
+    except Exception:
+        title = title_hint
+
+    try:
+        reminder.setCompleted_(True)
+        success, err = store.saveReminder_commit_error_(reminder, True, None)
+        if success:
+            return (True, title)
+        return (False, f"save failed: {err}")
+    except Exception as e:
+        return (False, f"error: {e}")
+
+
+def delete_reminder(title_hint: str) -> tuple:
+    """Find and permanently delete the reminder best matching title_hint.
+    Returns (True, matched_title) on success, (False, error_message) otherwise."""
+    if not _EK_AVAILABLE:
+        return (False, "EventKit is not available")
+    store = _EK.EKEventStore.alloc().init()
+    reminder = _find_best_reminder(title_hint, store=store)
+    if reminder is None:
+        return (False, f"no open reminder matches {title_hint!r}")
+
+    try:
+        title = reminder.title() or title_hint
+    except Exception:
+        title = title_hint
+
+    try:
+        success, err = store.removeReminder_commit_error_(reminder, True, None)
+        if success:
+            return (True, title)
+        return (False, f"delete failed: {err}")
+    except Exception as e:
+        return (False, f"error: {e}")
+
+
+def update_reminder(
+    title_hint: str,
+    new_title: Optional[str] = None,
+    new_due: Optional[datetime.datetime] = None,
+    new_notes: Optional[str] = None,
+) -> tuple:
+    """Find the best-matching open reminder and update any non-None fields.
+    Returns (True, matched_original_title) or (False, error)."""
+    if not _EK_AVAILABLE:
+        return (False, "EventKit is not available")
+    store = _EK.EKEventStore.alloc().init()
+    reminder = _find_best_reminder(title_hint, store=store)
+    if reminder is None:
+        return (False, f"no open reminder matches {title_hint!r}")
+
+    try:
+        original_title = reminder.title() or title_hint
+    except Exception:
+        original_title = title_hint
+
+    try:
+        if new_title:
+            reminder.setTitle_(new_title)
+        if new_due is not None:
+            # EKReminder expects NSDateComponents for its due date.
+            import Foundation
+            comps = Foundation.NSDateComponents.alloc().init()
+            comps.setYear_(new_due.year)
+            comps.setMonth_(new_due.month)
+            comps.setDay_(new_due.day)
+            comps.setHour_(new_due.hour)
+            comps.setMinute_(new_due.minute)
+            reminder.setDueDateComponents_(comps)
+        if new_notes is not None:
+            reminder.setNotes_(new_notes)
+        success, err = store.saveReminder_commit_error_(reminder, True, None)
+        if success:
+            return (True, original_title)
+        return (False, f"save failed: {err}")
+    except Exception as e:
+        return (False, f"error: {e}")
+
+
+def _find_best_event(
+    title_hint: str,
+    date_hint: Optional[datetime.date] = None,
+    window_days: int = 60,
+    store=None,
+):
+    """Search events in a date window around date_hint (or today +/- window_days),
+    return the EKEvent whose title best matches title_hint. None if no match."""
+    if not _EK_AVAILABLE:
+        return None
+    if store is None:
+        store = _EK.EKEventStore.alloc().init()
+
+    # Define the search window
+    if date_hint is not None:
+        anchor = datetime.datetime.combine(date_hint, datetime.time(0, 0, 0))
+        start_dt = anchor - datetime.timedelta(days=2)
+        end_dt = anchor + datetime.timedelta(days=2)
+    else:
+        start_dt = datetime.datetime.now() - datetime.timedelta(days=2)
+        end_dt = datetime.datetime.now() + datetime.timedelta(days=window_days)
+
+    import Foundation
+    ns_start = Foundation.NSDate.dateWithTimeIntervalSince1970_(start_dt.timestamp())
+    ns_end = Foundation.NSDate.dateWithTimeIntervalSince1970_(end_dt.timestamp())
+
+    predicate = store.predicateForEventsWithStartDate_endDate_calendars_(
+        ns_start, ns_end, None
+    )
+    events = store.eventsMatchingPredicate_(predicate) or []
+
+    best_score = 0.0
+    best = None
+    for e in events:
+        try:
+            title = e.title() or ""
+        except Exception:
+            title = ""
+        score = _fuzzy_match_score(title_hint, title)
+        if score > best_score:
+            best_score = score
+            best = e
+    return best if best_score >= 0.5 else None
+
+
+def delete_calendar_event(
+    title_hint: str,
+    date_hint: Optional[datetime.date] = None,
+) -> tuple:
+    """Find and delete the calendar event best matching title_hint.
+    An optional date_hint narrows the search window. Returns
+    (True, matched_title) on success or (False, error)."""
+    if not _EK_AVAILABLE:
+        return (False, "EventKit is not available")
+    store = _EK.EKEventStore.alloc().init()
+    event = _find_best_event(title_hint, date_hint=date_hint, store=store)
+    if event is None:
+        return (False, f"no upcoming event matches {title_hint!r}")
+
+    try:
+        title = event.title() or title_hint
+    except Exception:
+        title = title_hint
+
+    try:
+        # EKSpanThisEvent = only this occurrence, not future repeats. Safer.
+        success, err = store.removeEvent_span_commit_error_(
+            event, _EK.EKSpanThisEvent, True, None
+        )
+        if success:
+            return (True, title)
+        return (False, f"delete failed: {err}")
+    except Exception as e:
+        return (False, f"error: {e}")
