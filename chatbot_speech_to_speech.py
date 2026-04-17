@@ -244,6 +244,12 @@ _FAST_PATH_BANNED = frozenset({
     "file", "move", "rename", "find", "browser", "open",
     "screen", "timer", "battery", "volume", "brightness",
     "music", "lock", "shutdown", "restart",
+    # Sleep / wake-mode control must always go through
+    # _handle_system_command — otherwise the fast path answers "go to wake
+    # mode" with the LLM and Jarvis never actually stops listening.
+    "wake", "sleep", "goodbye", "stop", "listening",
+    # Mute is a system toggle and must not route to the LLM either.
+    "mute", "unmute",
 })
 
 _FAST_PATH_MAX_WORDS = 8
