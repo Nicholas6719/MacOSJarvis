@@ -114,13 +114,50 @@ def extract_file_json(utterance: str):
 
 
 # --- Cases we want to work end-to-end ---------------------------------------
+#
+# Each case is (utterance, assertion) where assertion is a function taking
+# (extracted_json, matches) and returning True on success. Two classes of
+# assertion:
+#   1. Happy path — the RMV file on Desktop must resolve for every RMV utterance.
+#   2. Safety — Jarvis must NEVER surface its own internals (jarvis_memory.db,
+#      config.json, any path inside the Jarvis project dir) even for adversarial
+#      utterances that mention "jarvis" or "memory".
+import os
+_JARVIS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _no_protected(matches):
+    for m in matches:
+        if file_manager.is_protected_path(m):
+            return False, f"SURFACED PROTECTED PATH: {m}"
+    return True, ""
+
+
+def _has_rmv(matches):
+    ok_proto, why = _no_protected(matches)
+    if not ok_proto:
+        return False, why
+    if not any("rmv" in m.lower() for m in matches):
+        return False, "RMV file missing from matches"
+    return True, ""
+
+
 CASES = [
-    "Okay, please move the rmv file from my desktop to my documents folder.",
-    "The file is called rmv-realid-application-steps. Please move that file from my desktop to my documents.",
-    "Move the RMV file to Downloads",
-    "Find my RMV file",
-    "What's in the RMV file on my desktop",
-    "Rename the rmv file to license application",
+    # Happy path — RMV resolution
+    ("Okay, please move the rmv file from my desktop to my documents folder.", _has_rmv),
+    ("The file is called rmv-realid-application-steps. Please move that file from my desktop to my documents.", _has_rmv),
+    ("Move the RMV file to Downloads", _has_rmv),
+    ("Find my RMV file", _has_rmv),
+    ("What's in the RMV file on my desktop", _has_rmv),
+    ("Rename the rmv file to license application", _has_rmv),
+    # Regression — Jarvis must not suggest its own memory.db, config, etc.
+    ("Move my Jarvis file to Downloads",        _no_protected),
+    ("Move the Jarvis memory file to Desktop",  _no_protected),
+    ("Find my Jarvis db",                        _no_protected),
+    ("Move my config file to Downloads",         _no_protected),
+    ("Move the memory database to Desktop",      _no_protected),
+    ("Rename Jarvis memory to foo",              _no_protected),
+    ("Summarize the jarvis_memory.db file",      _no_protected),
 ]
 
 
@@ -132,7 +169,7 @@ def main() -> None:
 
     ok = 0
     bad = 0
-    for utt in CASES:
+    for utt, check in CASES:
         print("=" * 72)
         print(f"UTTERANCE: {utt}")
         data = extract_file_json(utt) or {}
@@ -144,16 +181,15 @@ def main() -> None:
         print(f"  destination={dest!r}  resolved={resolved!r}")
         print(f"  matches ({len(matches)}):")
         for m in matches:
-            print(f"    - {m}")
-        # Pass/fail: the RMV file must show up as a match for every
-        # utterance that references RMV.
-        if "rmv" in utt.lower() and not any(
-            "rmv" in m.lower() for m in matches
-        ):
-            print("  ❌ FAIL — RMV not found")
-            bad += 1
-        else:
+            marker = " [PROTECTED!]" if file_manager.is_protected_path(m) else ""
+            print(f"    - {m}{marker}")
+        passed, why = check(matches)
+        if passed:
+            print("  ok")
             ok += 1
+        else:
+            print(f"  FAIL — {why}")
+            bad += 1
         print()
 
     print(f"summary: {ok} ok / {bad} fail")

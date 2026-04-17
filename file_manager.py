@@ -35,6 +35,57 @@ FILE_PREVIEW_MODE = "orb"
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _HOME = Path.home()
 
+# The Jarvis project directory itself. Anything inside it — jarvis_memory.db,
+# config.json, the Python source, kokoro weights, the frontend build, etc. —
+# is OFF-LIMITS to voice file operations. Jarvis must never move, rename,
+# describe, or even surface its own internals as a candidate.
+#
+# Resolved at import time from this file's own location, with a $JARVIS_DATA_DIR
+# override for the packaged macOS app (where the code may live inside the
+# bundle while data sits in ~/Library/Application Support/Jarvis).
+_JARVIS_PROJECT_DIR = Path(__file__).resolve().parent
+_JARVIS_DATA_DIR = Path(os.environ.get("JARVIS_DATA_DIR", "")).resolve() \
+    if os.environ.get("JARVIS_DATA_DIR") else None
+
+def _protected_roots() -> list[Path]:
+    roots = [_JARVIS_PROJECT_DIR]
+    if _JARVIS_DATA_DIR and _JARVIS_DATA_DIR != _JARVIS_PROJECT_DIR:
+        roots.append(_JARVIS_DATA_DIR)
+    return roots
+
+
+def is_protected_path(filepath: str) -> bool:
+    """True if `filepath` lives inside the Jarvis project dir or its data
+    dir. Voice file operations must refuse any protected path — we never
+    want Jarvis moving, renaming, or describing its own config, memory
+    database, model weights, or source code via the voice pipeline."""
+    try:
+        p = Path(filepath).expanduser().resolve()
+    except Exception:
+        return False
+    for root in _protected_roots():
+        try:
+            p.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+# File extensions that are developer / system artifacts, not user documents.
+# Voice file operations skip these even when mdfind matches them — the
+# user almost certainly doesn't mean "move my jarvis_memory.db by voice".
+_EXCLUDED_EXTENSIONS = {
+    ".db", ".sqlite", ".sqlite3", ".sqlite-journal", ".db-journal",
+    ".db-shm", ".db-wal", ".sqlite-shm", ".sqlite-wal",
+    ".pyc", ".pyo", ".pyd", ".so", ".dylib", ".a", ".o", ".bundle",
+    ".log", ".lock", ".pid", ".cache", ".tmp", ".temp", ".bak", ".swp",
+    ".class", ".jar", ".gguf", ".onnx", ".bin", ".pt", ".ckpt", ".safetensors",
+    ".DS_Store", ".ds_store",
+    # macOS app-library internal formats
+    ".tvdb", ".musicdb", ".itl", ".itc", ".itdb", ".tagset", ".plist",
+}
+
 _COMMON_DESTINATIONS = {
     "desktop":   str(_HOME / "Desktop"),
     "downloads": str(_HOME / "Downloads"),
@@ -68,6 +119,25 @@ _EXCLUDED_PATH_FRAGMENTS = (
     "/.DocumentRevisions-",
     "/.fseventsd/",
     "/node_modules/",
+    # macOS app library bundles — these contain internal databases the
+    # user should never be moving by voice (Music, TV, Photos, iMovie).
+    ".tvlibrary/",
+    ".musiclibrary/",
+    ".photoslibrary/",
+    ".imovielibrary/",
+    ".aplibrary/",
+    # App bundles and frameworks
+    ".app/Contents/",
+    ".bundle/Contents/",
+    ".framework/",
+    # Git and build dirs
+    "/.git/",
+    "/.venv/",
+    "/.venv311/",
+    "/__pycache__/",
+    "/build/",
+    "/dist/",
+    "/target/",
 )
 
 
@@ -83,12 +153,19 @@ _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".heic", ".webp", 
 # ── Search ────────────────────────────────────────────────────────────────────
 
 def _is_excluded(path: str) -> bool:
+    # Jarvis's own files first — never surface them as candidates.
+    if is_protected_path(path):
+        return True
     for prefix in _EXCLUDED_PATH_PREFIXES:
         if path.startswith(prefix):
             return True
     for frag in _EXCLUDED_PATH_FRAGMENTS:
         if frag in path:
             return True
+    # Skip developer/binary extensions — not what the user means by "my file".
+    ext = Path(path).suffix.lower()
+    if ext in _EXCLUDED_EXTENSIONS:
+        return True
     # Anything under a hidden directory in the user's home (e.g. ~/.cache)
     rel = path[len(str(_HOME)):] if path.startswith(str(_HOME)) else path
     for part in rel.split(os.sep):
@@ -103,7 +180,7 @@ def _is_excluded(path: str) -> bool:
 _QUERY_STOPWORDS = {
     "a", "an", "the", "my", "your", "our", "their", "this", "that", "these",
     "those", "from", "to", "in", "on", "into", "onto", "at", "with", "please",
-    "jarvis", "file", "files", "document", "doc", "docs",
+    "file", "files", "document", "doc", "docs",
     "folder", "directory", "called", "named", "titled", "image", "images",
     "picture", "photo", "and", "or", "of", "for",
     "me", "us", "is", "it", "some", "any", "all", "pdf",
@@ -116,6 +193,13 @@ _QUERY_STOPWORDS = {
     # query when the LLM includes too much of the utterance.
     "move", "rename", "find", "locate", "summarize", "summarise",
     "describe", "read", "open", "put", "send", "transfer",
+    # Jarvis's own name and adjacent words. If these leak into the
+    # query (e.g. the LLM carried the wake prefix through, or STT
+    # confused RMV with Jarvis), pass-3 would match the project's
+    # own jarvis_memory.db. Treat them as filler so Jarvis never
+    # searches for itself by voice.
+    "jarvis", "jarvisapp", "memory", "config", "settings",
+    "database", "log", "logs", "db",
 }
 
 
@@ -478,10 +562,19 @@ def get_active_preview_path() -> Optional[str]:
 def move_file(source_path: str, destination_path: str) -> tuple[bool, str]:
     """Move the original file to destination. destination_path may be a
     directory (in which case the original filename is preserved) or a
-    full target path. Never touches temp preview files."""
+    full target path. Never touches temp preview files.
+
+    Refuses any source or destination inside Jarvis's own project or
+    data directory — this is the final safety net after search-level
+    exclusion. Even if a protected file somehow makes it through to a
+    confirmation prompt, the actual filesystem operation will not run."""
     try:
         src = Path(source_path).expanduser()
         dst = Path(destination_path).expanduser()
+        if is_protected_path(str(src)):
+            return (False, "that file is part of Jarvis's own system and can't be moved")
+        if is_protected_path(str(dst)):
+            return (False, "that destination is inside Jarvis's own system")
         if not src.exists():
             return (False, f"source file not found: {source_path}")
         if dst.is_dir():
@@ -498,9 +591,13 @@ def move_file(source_path: str, destination_path: str) -> tuple[bool, str]:
 
 def rename_file(filepath: str, new_name: str) -> tuple[bool, str]:
     """Rename the file in place, keeping its directory. If new_name has no
-    extension, preserve the original file's extension."""
+    extension, preserve the original file's extension.
+
+    Refuses any path inside Jarvis's own project or data directory."""
     try:
         src = Path(filepath).expanduser()
+        if is_protected_path(str(src)):
+            return (False, "that file is part of Jarvis's own system and can't be renamed")
         if not src.exists():
             return (False, f"file not found: {filepath}")
         new = (new_name or "").strip()
