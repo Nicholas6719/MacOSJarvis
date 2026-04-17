@@ -40,7 +40,7 @@ SCREENSHOT_PATH = "/tmp/jarvis_screen_capture.png"
 # if you want the larger 2B.
 _MOONDREAM_CACHE_DIR = Path.home() / ".cache" / "moondream"
 _MOONDREAM_MODEL_FILENAME = os.environ.get(
-    "JARVIS_MOONDREAM_MODEL", "moondream-0_5b-int8.mf.gz"
+    "JARVIS_MOONDREAM_MODEL", "moondream-2b-int8.mf.gz"
 )
 _MOONDREAM_MODEL_URL = (
     "https://huggingface.co/vikhyatk/moondream2/resolve/onnx/"
