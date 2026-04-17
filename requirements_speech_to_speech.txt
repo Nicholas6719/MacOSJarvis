@@ -7,3 +7,8 @@ websockets
 numpy
 huggingface_hub
 setuptools
+# EventKit via PyObjC — used by calendar_reminders.get_all_reminders to
+# bypass AppleScript's catastrophically slow `whose completed is false`
+# query (200x faster than AppleScript on large reminder lists). Falls
+# back to the AppleScript path if this package isn't installed.
+pyobjc-framework-EventKit
