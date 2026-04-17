@@ -718,22 +718,59 @@ def update_reminder(
         original_title = title_hint
 
     try:
+        import Foundation
         if new_title:
             reminder.setTitle_(new_title)
         if new_due is not None:
-            # EKReminder expects NSDateComponents for its due date.
-            import Foundation
+            # EKReminder expects NSDateComponents for its due date AND the
+            # components need an explicit NSCalendar attached, otherwise
+            # EventKit can't resolve them to a real date and silently
+            # discards the new value — the save reports success but the
+            # reminder keeps its old due time (the exact bug Nicholas hit).
+            gregorian = Foundation.NSCalendar.alloc().initWithCalendarIdentifier_(
+                Foundation.NSCalendarIdentifierGregorian
+            )
             comps = Foundation.NSDateComponents.alloc().init()
+            comps.setCalendar_(gregorian)
             comps.setYear_(new_due.year)
             comps.setMonth_(new_due.month)
             comps.setDay_(new_due.day)
             comps.setHour_(new_due.hour)
             comps.setMinute_(new_due.minute)
             reminder.setDueDateComponents_(comps)
+
+            # Reminders created with a due date also carry an NSAlarm that
+            # fires at the old time. Setting dueDateComponents does not
+            # update the alarm, and the alarm's trigger date is what
+            # Reminders.app sorts and displays by on macOS 14+ — so the
+            # UI still shows the old time unless we also replace the
+            # alarm. Remove any existing alarms and add a fresh one at
+            # the new due date.
+            existing = list(reminder.alarms() or [])
+            for a in existing:
+                try:
+                    reminder.removeAlarm_(a)
+                except Exception:
+                    pass
+            try:
+                ns_due = Foundation.NSDate.dateWithTimeIntervalSince1970_(
+                    new_due.timestamp()
+                )
+                new_alarm = _EK.EKAlarm.alarmWithAbsoluteDate_(ns_due)
+                reminder.addAlarm_(new_alarm)
+            except Exception as e:
+                print(f"[Calendar] alarm update warning: {e}")
         if new_notes is not None:
             reminder.setNotes_(new_notes)
         success, err = store.saveReminder_commit_error_(reminder, True, None)
         if success:
+            # Force a store refresh so subsequent reads see the change.
+            # Without this, an immediate `get_all_reminders()` call may
+            # still return the cached old value.
+            try:
+                store.refreshSourcesIfNecessary()
+            except Exception:
+                pass
             return (True, original_title)
         return (False, f"save failed: {err}")
     except Exception as e:
