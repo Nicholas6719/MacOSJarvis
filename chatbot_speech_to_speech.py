@@ -229,6 +229,12 @@ class VoiceAssistant:
         self._needs_wake_summarization = True  # Fires on first wake-mode iteration
         self._summarizing = False              # Prevent concurrent summarization runs
         self._first_summarization = True       # Only speak the memory-update line at startup
+        # llama-cpp-python is NOT thread-safe — two concurrent calls to
+        # self._llm.create_chat_completion on the same Llama instance will
+        # crash the whole process with SIGSEGV. This lock serializes every
+        # call site (chat streaming, calendar extraction/summaries, memory
+        # summarization). Any method that touches self._llm must hold it.
+        self._llm_lock = threading.Lock()
         self._stop_speak = threading.Event()
         self._tts_speaking = False
         self._cancel_timer = threading.Event()
@@ -1526,19 +1532,23 @@ class VoiceAssistant:
                     max_tokens: int = 200, temperature: float = 0.6) -> str:
         """One-shot LLM call with no history side effects. Used for calendar
         summaries, confirmations, and JSON extraction so system-crafted
-        prompts never pollute the conversation history."""
+        prompts never pollute the conversation history.
+
+        Serialized with self._llm_lock — llama-cpp-python crashes hard
+        (SIGSEGV) if two threads hit the same Llama instance concurrently."""
         try:
-            result = self._llm.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=0.9,
-                stop=["<|eot_id|>"],
-                stream=False,
-            )
+            with self._llm_lock:
+                result = self._llm.create_chat_completion(
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=0.9,
+                    stop=["<|eot_id|>"],
+                    stream=False,
+                )
             text = (result["choices"][0]["message"]["content"] or "").strip()
             return _clean(text)
         except Exception as e:
@@ -2601,17 +2611,20 @@ class VoiceAssistant:
                     )
 
                     # Silent non-streaming LLM call — no TTS, no history mutation.
-                    result = self._llm.create_chat_completion(
-                        messages=[
-                            {"role": "system", "content": "You are a concise summarizer. Reply with only the summary."},
-                            {"role": "user", "content": summary_prompt},
-                        ],
-                        max_tokens=160,
-                        temperature=0.3,
-                        top_p=0.9,
-                        stop=["<|eot_id|>"],
-                        stream=False,
-                    )
+                    # Held under _llm_lock so we don't collide with a chat
+                    # turn or calendar worker running at the same time.
+                    with self._llm_lock:
+                        result = self._llm.create_chat_completion(
+                            messages=[
+                                {"role": "system", "content": "You are a concise summarizer. Reply with only the summary."},
+                                {"role": "user", "content": summary_prompt},
+                            ],
+                            max_tokens=160,
+                            temperature=0.3,
+                            top_p=0.9,
+                            stop=["<|eot_id|>"],
+                            stream=False,
+                        )
                     summary_text = (
                         result["choices"][0]["message"]["content"] or ""
                     ).strip()
@@ -2702,17 +2715,19 @@ class VoiceAssistant:
                 )
 
             # Silent non-streaming LLM call — never TTS, never touches history.
-            result = self._llm.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": "You are a concise long-range memory compressor. Reply with only the paragraph."},
-                    {"role": "user", "content": meta_prompt},
-                ],
-                max_tokens=200,
-                temperature=0.3,
-                top_p=0.9,
-                stop=["<|eot_id|>"],
-                stream=False,
-            )
+            # Held under _llm_lock to serialize with other LLM callers.
+            with self._llm_lock:
+                result = self._llm.create_chat_completion(
+                    messages=[
+                        {"role": "system", "content": "You are a concise long-range memory compressor. Reply with only the paragraph."},
+                        {"role": "user", "content": meta_prompt},
+                    ],
+                    max_tokens=200,
+                    temperature=0.3,
+                    top_p=0.9,
+                    stop=["<|eot_id|>"],
+                    stream=False,
+                )
             meta_text = (
                 result["choices"][0]["message"]["content"] or ""
             ).strip()
@@ -2779,40 +2794,44 @@ class VoiceAssistant:
             prefixed = memory_context + user_text
             messages = messages[:-1] + [{"role": "user", "content": prefixed}]
 
-        stream = self._llm.create_chat_completion(
-            messages=messages,
-            max_tokens=self._llm_cfg.get("max_new_tokens", 256),
-            temperature=self._llm_cfg.get("temperature", 0.7),
-            top_p=self._llm_cfg.get("top_p", 0.9),
-            stop=["<|eot_id|>", "\nUser:", "\nYou:"],
-            stream=True,
-        )
-
+        # Held under _llm_lock for the ENTIRE generator iteration — a
+        # concurrent LLM call from memory summarization or a calendar
+        # worker would otherwise corrupt llama-cpp's internal state and
+        # crash the process (SIGSEGV / exit code 11).
         buf  = ""
         full = ""
+        with self._llm_lock:
+            stream = self._llm.create_chat_completion(
+                messages=messages,
+                max_tokens=self._llm_cfg.get("max_new_tokens", 256),
+                temperature=self._llm_cfg.get("temperature", 0.7),
+                top_p=self._llm_cfg.get("top_p", 0.9),
+                stop=["<|eot_id|>", "\nUser:", "\nYou:"],
+                stream=True,
+            )
 
-        for chunk in stream:
-            delta: str = chunk["choices"][0]["delta"].get("content", "") or ""
-            buf  += delta
-            full += delta
+            for chunk in stream:
+                delta: str = chunk["choices"][0]["delta"].get("content", "") or ""
+                buf  += delta
+                full += delta
 
-            parts = SENTENCE_RE.split(buf)
-            if len(parts) > 1:
-                for sentence in parts[:-1]:
-                    c = _clean(sentence)
-                    if c:
-                        yield c
-                buf = parts[-1]
-                continue
-
-            if len(buf.split()) >= MIN_CLAUSE_WORDS:
-                clauses = CLAUSE_RE.split(buf)
-                if len(clauses) > 1:
-                    for clause in clauses[:-1]:
-                        c = _clean(clause)
+                parts = SENTENCE_RE.split(buf)
+                if len(parts) > 1:
+                    for sentence in parts[:-1]:
+                        c = _clean(sentence)
                         if c:
                             yield c
-                    buf = clauses[-1]
+                    buf = parts[-1]
+                    continue
+
+                if len(buf.split()) >= MIN_CLAUSE_WORDS:
+                    clauses = CLAUSE_RE.split(buf)
+                    if len(clauses) > 1:
+                        for clause in clauses[:-1]:
+                            c = _clean(clause)
+                            if c:
+                                yield c
+                        buf = clauses[-1]
 
         if buf.strip():
             c = _clean(buf)
