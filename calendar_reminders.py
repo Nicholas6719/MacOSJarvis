@@ -15,11 +15,21 @@ failure propagate into the main voice pipeline.
 """
 
 import datetime
+import logging
 import re
 import subprocess
 import threading
 import time
 from typing import Optional
+
+logger = logging.getLogger("jarvis")
+
+# Calendar-read backend switch. "eventkit" (default) uses the native
+# EKEventStore API — 10-20x faster than AppleScript because it doesn't
+# cold-launch Calendar.app and doesn't scan calendars serially with a
+# `whose` clause. "applescript" forces the legacy path for debugging.
+# Any other value is treated as "eventkit".
+CALENDAR_READ_BACKEND = "eventkit"
 
 # EventKit via PyObjC is Apple's native Calendar/Reminders API — dramatically
 # faster than AppleScript for reads. A Reminders fetch with AppleScript's
@@ -294,8 +304,10 @@ def _read_events_script(start_dt: datetime.datetime, end_dt: datetime.datetime) 
     )
 
 
-def get_today_events() -> list:
-    """Return every calendar event scheduled for today, across all calendars."""
+def _get_today_events_applescript() -> list:
+    """Legacy AppleScript reader for today's events — kept as a fallback
+    for `get_today_events` when CALENDAR_READ_BACKEND is 'applescript' or
+    the EventKit path raises."""
     _ensure_app_running("Calendar")
     today = datetime.date.today()
     start = datetime.datetime.combine(today, datetime.time(0, 0, 0))
@@ -304,12 +316,9 @@ def get_today_events() -> list:
     return _parse_records(raw, _EVENT_FIELDS)
 
 
-def get_upcoming_events() -> list:
-    """Return every event from today through the end of this coming Saturday.
-
-    If today is Sunday, covers Sun through next Saturday (7 days).
-    If today is Saturday, covers only today.
-    Otherwise covers today through Saturday of the current week."""
+def _get_upcoming_events_applescript() -> list:
+    """Legacy AppleScript reader for the rest-of-week events — see
+    _get_today_events_applescript for the fallback rationale."""
     _ensure_app_running("Calendar")
     today = datetime.date.today()
     # Python weekday: Mon=0 ... Sun=6. We want to cover [today, midnight-after-Saturday).
@@ -318,6 +327,212 @@ def get_upcoming_events() -> list:
     end = start + datetime.timedelta(days=days_until_sat + 1)
     raw = _run_osa(_read_events_script(start, end), timeout=25)
     return _parse_records(raw, _EVENT_FIELDS)
+
+
+# ── EventKit-backed event reads ─────────────────────────────────────────
+#
+# EKEventStore.eventsMatchingPredicate_ is synchronous and bypasses both
+# the Calendar.app cold-launch cost and the per-calendar `whose` clause.
+# Downstream consumers (the notification monitor, LLM summarizer, and
+# _format_event_lines) all read dict string fields — we match the legacy
+# record shape exactly so the migration is a drop-in replacement.
+
+def _ns_date_to_applescript_str(ns_date) -> str:
+    """Render an EventKit NSDate using the same format AppleScript emits
+    ('Friday, April 17, 2026 at 10:00:00 AM') so _parse_applescript_date
+    in the notification monitor keeps working without modification."""
+    if ns_date is None:
+        return ""
+    try:
+        ts = ns_date.timeIntervalSince1970()
+        dt = datetime.datetime.fromtimestamp(ts)
+        return dt.strftime("%A, %B %d, %Y at %I:%M:%S %p")
+    except Exception:
+        return ""
+
+
+def _ek_event_to_record(ek_event) -> dict:
+    """Convert an EKEvent to the dict shape the rest of the codebase
+    expects from get_today_events / get_upcoming_events. Every field
+    is a string so json/formatting paths stay identical."""
+    def _safe(attr, default=""):
+        try:
+            v = getattr(ek_event, attr)()
+        except Exception:
+            return default
+        if v is None:
+            return default
+        return v
+
+    title = _safe("title") or ""
+    start = _ns_date_to_applescript_str(_safe("startDate", None))
+    end = _ns_date_to_applescript_str(_safe("endDate", None))
+    location = _safe("location") or ""
+    notes = _safe("notes") or ""
+
+    cal_name = ""
+    try:
+        cal = ek_event.calendar()
+        if cal is not None:
+            cal_name = cal.title() or ""
+    except Exception:
+        pass
+
+    return {
+        "title": str(title),
+        "start": start,
+        "end": end,
+        "location": str(location),
+        "notes": str(notes),
+        "calendar": str(cal_name),
+    }
+
+
+def _eventkit_events_in_range(start_dt: datetime.datetime,
+                              end_dt: datetime.datetime) -> list:
+    """Query EventKit for every event in [start_dt, end_dt), filter out
+    calendars in _READ_SKIP_CALENDAR_NAMES, sort by start time, and
+    return the legacy dict shape."""
+    if not _EK_AVAILABLE:
+        raise RuntimeError("EventKit not available")
+
+    import Foundation
+    store = _EK.EKEventStore.alloc().init()
+
+    # Trigger a calendar-events permission request on first use. The
+    # completion handler is optional — we continue immediately and the
+    # predicate call itself will fail cleanly if access is denied.
+    try:
+        if hasattr(store, "requestFullAccessToEventsWithCompletion_"):
+            # macOS 14+ API. Fire-and-forget; the OS caches the grant.
+            store.requestFullAccessToEventsWithCompletion_(lambda *_: None)
+        elif hasattr(store, "requestAccessToEntityType_completion_"):
+            store.requestAccessToEntityType_completion_(
+                _EK.EKEntityTypeEvent, lambda *_: None,
+            )
+    except Exception as e:
+        logger.warning(f"event access request raised (non-fatal): {e}")
+
+    ns_start = Foundation.NSDate.dateWithTimeIntervalSince1970_(start_dt.timestamp())
+    ns_end = Foundation.NSDate.dateWithTimeIntervalSince1970_(end_dt.timestamp())
+
+    # Scope to non-skipped calendars so the synthetic / subscription
+    # calendars (Scheduled Reminders, Holidays, Birthdays, Siri
+    # Suggestions) stay out of the results — identical behaviour to the
+    # AppleScript path.
+    try:
+        all_cals = store.calendarsForEntityType_(_EK.EKEntityTypeEvent) or []
+    except Exception:
+        all_cals = []
+    kept = []
+    for cal in all_cals:
+        try:
+            if (cal.title() or "") not in _READ_SKIP_CALENDAR_NAMES:
+                kept.append(cal)
+        except Exception:
+            continue
+
+    # Passing None for the calendars arg queries every calendar — used
+    # as the fallback if we couldn't enumerate for any reason.
+    predicate = store.predicateForEventsWithStartDate_endDate_calendars_(
+        ns_start, ns_end, kept if kept else None,
+    )
+    events = store.eventsMatchingPredicate_(predicate) or []
+
+    records = []
+    for e in events:
+        try:
+            records.append(_ek_event_to_record(e))
+        except Exception as ex:
+            logger.warning(f"event record build failed: {ex}")
+    # Stable sort by startDate (NSDate) — we already have the string, so
+    # sort by the underlying timestamp to get correct chronological order.
+    def _sort_key(rec):
+        try:
+            return datetime.datetime.strptime(
+                rec.get("start", ""), "%A, %B %d, %Y at %I:%M:%S %p",
+            )
+        except Exception:
+            return datetime.datetime.max
+    records.sort(key=_sort_key)
+    return records
+
+
+def _get_today_events_eventkit() -> list:
+    today = datetime.date.today()
+    start = datetime.datetime.combine(today, datetime.time(0, 0, 0))
+    end = start + datetime.timedelta(days=1)
+    return _eventkit_events_in_range(start, end)
+
+
+def _get_upcoming_events_eventkit() -> list:
+    today = datetime.date.today()
+    days_until_sat = (5 - today.weekday()) % 7
+    start = datetime.datetime.combine(today, datetime.time(0, 0, 0))
+    end = start + datetime.timedelta(days=days_until_sat + 1)
+    return _eventkit_events_in_range(start, end)
+
+
+# ── Public dispatch ──────────────────────────────────────────────────────
+
+def get_today_events() -> list:
+    """Return every calendar event scheduled for today, across all calendars.
+
+    Dispatches to the EventKit or AppleScript backend based on
+    CALENDAR_READ_BACKEND. When EventKit raises (e.g. permission denied),
+    falls back to the AppleScript implementation automatically."""
+    t0 = time.time()
+    if CALENDAR_READ_BACKEND == "applescript":
+        result = _get_today_events_applescript()
+        logger.info(f"get_today_events (AppleScript) completed in {time.time()-t0:.2f}s")
+        return result
+    try:
+        result = _get_today_events_eventkit()
+        logger.info(f"get_today_events (EventKit) completed in {time.time()-t0:.2f}s")
+        return result
+    except Exception as e:
+        logger.warning(
+            f"EventKit calendar read failed, falling back to AppleScript: {e}"
+        )
+        result = _get_today_events_applescript()
+        logger.info(
+            f"get_today_events (AppleScript fallback) completed in "
+            f"{time.time()-t0:.2f}s"
+        )
+        return result
+
+
+def get_upcoming_events() -> list:
+    """Return every event from today through the end of this coming Saturday.
+
+    If today is Sunday, covers Sun through next Saturday (7 days).
+    If today is Saturday, covers only today.
+    Otherwise covers today through Saturday of the current week.
+
+    Backend dispatch identical to get_today_events()."""
+    t0 = time.time()
+    if CALENDAR_READ_BACKEND == "applescript":
+        result = _get_upcoming_events_applescript()
+        logger.info(
+            f"get_upcoming_events (AppleScript) completed in {time.time()-t0:.2f}s"
+        )
+        return result
+    try:
+        result = _get_upcoming_events_eventkit()
+        logger.info(
+            f"get_upcoming_events (EventKit) completed in {time.time()-t0:.2f}s"
+        )
+        return result
+    except Exception as e:
+        logger.warning(
+            f"EventKit calendar read failed, falling back to AppleScript: {e}"
+        )
+        result = _get_upcoming_events_applescript()
+        logger.info(
+            f"get_upcoming_events (AppleScript fallback) completed in "
+            f"{time.time()-t0:.2f}s"
+        )
+        return result
 
 
 _REMINDER_FIELDS = ["title", "due", "notes"]

@@ -217,9 +217,9 @@ def _section_calendar(r: Runner) -> None:
     r.test('classify_calendar("dentist appointment") → Home', cl_home)
 
     r.timing(
-        "get_today_events under 5s",
+        "get_today_events under 2s (EventKit)",
         lambda: cal.get_today_events(),
-        threshold_s=5.0,
+        threshold_s=2.0,
     )
 
 
