@@ -2332,6 +2332,43 @@ class VoiceAssistant:
         Uses the dedicated `_extract_update_json` prompt (NOT the general
         event extractor) so the user's identifier for the reminder doesn't
         get mistakenly interpreted as a new title."""
+        # ── Rename fast-path ──────────────────────────────────────────────
+        # "rename X to Y" has an unambiguous structure — X is the target
+        # hint, Y is the new title, split on " to ". The 3B LLM gets this
+        # wrong when Y is long and syntactically continues X (e.g. Nicholas
+        # said "rename GPT subscription reminder to consider canceling GPT
+        # subscription" and the LLM packed BOTH halves into new_title).
+        # Regex handles this deterministically and never hallucinates.
+        _rename = re.match(
+            r"^\s*(?:please\s+|can\s+you\s+|could\s+you\s+)?"
+            r"rename\s+(?:the\s+)?(?P<old>.+?)\s+to\s+(?P<new>.+?)\s*[.!?]?\s*$",
+            user_input.strip(),
+            re.IGNORECASE,
+        )
+        if _rename:
+            old_hint = _rename.group("old").strip()
+            new_title = _rename.group("new").strip().rstrip(".,!?")
+            # Strip "reminder" suffix from the old-title hint.
+            old_hint = re.sub(
+                r"\s+reminder\s*$", "", old_hint, flags=re.IGNORECASE
+            ).strip()
+            print(
+                f"[Calendar] rename fast-path: old={old_hint!r} -> new={new_title!r}"
+            )
+            success, msg = calendar_reminders.update_reminder(
+                old_hint, new_title=new_title
+            )
+            if success:
+                self._safe_speak(
+                    f"Renamed the {msg} reminder to {new_title}, Sir."
+                )
+            else:
+                self._safe_speak(
+                    f"I couldn't find a reminder matching {old_hint!r}, Sir."
+                )
+            return
+
+        # ── General update path (reschedule, change notes, etc.) ──────────
         hint = self._extract_target_hint(user_input)
         print(f"[Calendar] update_reminder hint={hint!r}")
         if not hint:
