@@ -2813,10 +2813,24 @@ class VoiceAssistant:
             for m in matches:
                 print(f"[File]   - {m}")
             if not matches:
-                self.speak_direct(
-                    "I couldn't find anything matching that, Sir. "
-                    "Can you be more specific?"
-                )
+                # If the walk hit permission errors, Spotlight is probably
+                # also TCC-filtered — tell the user clearly so they can
+                # grant access once and move on, instead of thinking the
+                # file isn't there.
+                denied = file_manager.get_last_permission_errors()
+                if denied:
+                    print(f"[File] permission denied on: {denied}")
+                    self.speak_direct(
+                        "I can't see your files right now, Sir. "
+                        "You'll need to grant Jarvis access to your folders "
+                        "in System Settings under Privacy and Security, "
+                        "then try again."
+                    )
+                else:
+                    self.speak_direct(
+                        "I couldn't find anything matching that, Sir. "
+                        "Can you be more specific?"
+                    )
                 return
 
             if intent == "file_find":

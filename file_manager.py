@@ -226,12 +226,111 @@ def _filter_and_rank(raw: list[str]) -> list[str]:
         if _is_excluded(path):
             continue
         try:
+            # Require a regular file — never surface directories, bundles,
+            # or mount points. Voice file ops move/rename real documents,
+            # not folders like /Applications.
+            if not os.path.isfile(path):
+                continue
             mtime = os.path.getmtime(path)
         except OSError:
             continue
         candidates.append((mtime, path))
     candidates.sort(key=lambda x: x[0], reverse=True)
     return [path for _, path in candidates[:5]]
+
+
+# ── Direct filesystem walk (TCC-tolerant fallback) ────────────────────────
+#
+# mdfind depends on the Spotlight index, and macOS TCC can filter Spotlight
+# results per-app. A process launched inside JarvisApp.app may get zero
+# results for `mdfind -name "rmv"` even though the file exists on Desktop,
+# because JarvisApp hasn't been granted Desktop access. The direct walk
+# hits the filesystem instead — it either works (non-sandboxed / granted)
+# or raises PermissionError (which we catch and report). Scoped to the
+# user's top-level common folders at shallow depth so it stays fast.
+
+_WALK_ROOTS: tuple[Path, ...] = (
+    _HOME / "Desktop",
+    _HOME / "Downloads",
+    _HOME / "Documents",
+    _HOME / "Pictures",
+    _HOME / "Music",
+    _HOME / "Movies",
+)
+_WALK_MAX_DEPTH = 3
+_WALK_MAX_HITS = 50  # stop early — we only return the top 5 anyway
+_walk_permission_error_paths: list[str] = []
+
+
+def _walk_search(tokens: list[str]) -> list[str]:
+    """Walk the user's common folders and match files whose names contain
+    ALL given tokens (case-insensitive). Returns absolute paths."""
+    global _walk_permission_error_paths
+    _walk_permission_error_paths = []
+
+    if not tokens:
+        return []
+
+    lower_tokens = [t.lower() for t in tokens]
+    hits: list[str] = []
+
+    for root in _WALK_ROOTS:
+        if not root.is_dir():
+            # Either the folder doesn't exist or we can't even stat it.
+            try:
+                root.stat()
+            except PermissionError:
+                _walk_permission_error_paths.append(str(root))
+            except OSError:
+                pass
+            continue
+
+        root_str = str(root)
+        try:
+            walker = os.walk(root_str, followlinks=False, onerror=_walk_on_error)
+            for dirpath, dirnames, filenames in walker:
+                depth = dirpath[len(root_str):].count(os.sep)
+                if depth >= _WALK_MAX_DEPTH:
+                    dirnames.clear()
+                    continue
+                # Skip hidden and excluded-fragment directories up front.
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not d.startswith(".")
+                    and not any(frag.strip("/") in d for frag in _EXCLUDED_PATH_FRAGMENTS)
+                ]
+                for fname in filenames:
+                    if fname.startswith("."):
+                        continue
+                    name_lower = fname.lower()
+                    if not all(t in name_lower for t in lower_tokens):
+                        continue
+                    full = os.path.join(dirpath, fname)
+                    if _is_excluded(full):
+                        continue
+                    hits.append(full)
+                    if len(hits) >= _WALK_MAX_HITS:
+                        return hits
+        except PermissionError:
+            _walk_permission_error_paths.append(root_str)
+        except OSError:
+            continue
+
+    return hits
+
+
+def _walk_on_error(err: OSError) -> None:
+    """os.walk onerror callback — record permission failures so the
+    chatbot can mention them to the user. Suppress the raise so the
+    walk keeps going through the other roots."""
+    if isinstance(err, PermissionError):
+        _walk_permission_error_paths.append(str(err.filename or "<unknown>"))
+
+
+def get_last_permission_errors() -> list[str]:
+    """Returns the list of paths where the last walk hit a permission
+    error — used to surface TCC issues to the user."""
+    return list(_walk_permission_error_paths)
 
 
 def _tokenize_query(q: str) -> list[str]:
@@ -241,14 +340,22 @@ def _tokenize_query(q: str) -> list[str]:
 
 
 def search_file(query: str) -> list[str]:
-    """Search the Mac by filename via mdfind. Returns up to 5 user-relevant
-    matches sorted most-recently-modified first.
+    """Search by filename. Returns up to 5 user-relevant matches sorted
+    most-recently-modified first.
 
-    Strategy — try progressively looser queries so messy LLM-extracted
-    strings still find real files:
-      1. literal substring:   `mdfind -name "<q>"`
-      2. AND query on all tokens (stopwords stripped) via kMDItemFSName
-      3. per-token search, first hit wins
+    Strategy:
+      1. mdfind literal substring:   `mdfind -name "<q>"`
+      2. mdfind AND on all tokens:   `kMDItemFSName == "*t1*"cd && …`
+      3. Direct filesystem walk of the user's common folders — used
+         when mdfind returns nothing (e.g. TCC is filtering Spotlight
+         results for the current process, which is the common case
+         when Jarvis runs inside JarvisApp.app without Full Disk
+         Access). Also the only way to find a file that was just
+         created before Spotlight indexed it.
+
+    We deliberately do NOT do a "try each token alone" pass — that
+    produced false positives like `/Applications` matching a query
+    for "rmv-realid-application-steps" via the "application" token.
     """
     q = (query or "").strip()
     if not q:
@@ -256,34 +363,53 @@ def search_file(query: str) -> list[str]:
 
     print(f"[file_manager] search_file query={q!r}")
 
-    # Pass 1 — literal substring match on the whole query.
+    # Pass 1 — literal substring on the whole query via Spotlight.
     raw = _run_mdfind(["mdfind", "-name", q])
     ranked = _filter_and_rank(raw)
     if ranked:
-        print(f"[file_manager] pass-1 matches={len(ranked)}")
+        print(f"[file_manager] pass-1 (mdfind literal) matches={len(ranked)}")
         return ranked
 
-    # Pass 2 — tokenize, keep distinctive words, AND them together.
+    # Tokenize once — shared by pass 2 and pass 3.
     tokens = _tokenize_query(q)
+
+    # Pass 2 — mdfind AND-query on all distinctive tokens.
     if tokens:
         and_query = " && ".join(f'kMDItemFSName == "*{t}*"cd' for t in tokens)
         raw = _run_mdfind(["mdfind", and_query])
         ranked = _filter_and_rank(raw)
         if ranked:
-            print(f"[file_manager] pass-2 tokens={tokens} matches={len(ranked)}")
+            print(f"[file_manager] pass-2 (mdfind AND {tokens}) matches={len(ranked)}")
             return ranked
 
-        # Pass 3 — last resort, try each token alone (most distinctive first,
-        # rough heuristic: longer tokens are more distinctive). Take the
-        # first token that yields any hits.
-        for t in sorted(set(tokens), key=len, reverse=True):
-            raw = _run_mdfind(["mdfind", "-name", t])
-            ranked = _filter_and_rank(raw)
-            if ranked:
-                print(f"[file_manager] pass-3 token={t!r} matches={len(ranked)}")
-                return ranked
+    # Pass 3 — direct filesystem walk. Bypasses Spotlight/TCC filtering.
+    # We try the full query (literal substring, whitespace normalized) AND
+    # the tokenized version. Use whichever returns more.
+    walk_tokens: list[str] = []
+    # Literal search — turn the whole query into one match token, lowercase.
+    # Good for "rmv-realid-application-steps" → matches exact filename.
+    literal = re.sub(r"\s+", "", q.lower())
+    if literal and len(literal) >= 2:
+        walk_tokens = [literal]
+    walk_results_literal = _walk_search(walk_tokens) if walk_tokens else []
 
-    print("[file_manager] no matches")
+    walk_results_tokens = _walk_search(tokens) if tokens else []
+
+    # Prefer whichever found more — tokens are usually more robust.
+    walk_results = (
+        walk_results_tokens if len(walk_results_tokens) >= len(walk_results_literal)
+        else walk_results_literal
+    )
+    ranked = _filter_and_rank(walk_results)
+    if ranked:
+        print(f"[file_manager] pass-3 (filesystem walk) matches={len(ranked)}")
+        return ranked
+
+    perms = get_last_permission_errors()
+    if perms:
+        print(f"[file_manager] no matches (permission denied on: {perms})")
+    else:
+        print("[file_manager] no matches")
     return []
 
 

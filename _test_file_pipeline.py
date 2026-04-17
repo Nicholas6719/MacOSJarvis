@@ -161,38 +161,57 @@ CASES = [
 ]
 
 
+def _run_cases(label: str, cases, spotlight_blind: bool = False) -> tuple[int, int]:
+    print(f"\n#### {label} ####\n")
+    orig_mdfind = file_manager._run_mdfind
+    if spotlight_blind:
+        file_manager._run_mdfind = lambda args: []
+    ok = 0
+    bad = 0
+    try:
+        for utt, check in cases:
+            print("=" * 72)
+            print(f"UTTERANCE: {utt}")
+            data = extract_file_json(utt) or {}
+            print(f"  extracted: {data}")
+            query = (data.get("query") or "").strip() or utt
+            matches = file_manager.search_file(query)
+            dest = data.get("destination")
+            resolved = file_manager.resolve_destination(dest) if dest else None
+            print(f"  destination={dest!r}  resolved={resolved!r}")
+            print(f"  matches ({len(matches)}):")
+            for m in matches:
+                marker = " [PROTECTED!]" if file_manager.is_protected_path(m) else ""
+                print(f"    - {m}{marker}")
+            passed, why = check(matches)
+            if passed:
+                print("  ok")
+                ok += 1
+            else:
+                print(f"  FAIL — {why}")
+                bad += 1
+            print()
+    finally:
+        file_manager._run_mdfind = orig_mdfind
+    return ok, bad
+
+
 def main() -> None:
     global _LLM
     print("[test] loading LLM…")
     _LLM = _load_llm()
     print("[test] ready\n")
 
-    ok = 0
-    bad = 0
-    for utt, check in CASES:
-        print("=" * 72)
-        print(f"UTTERANCE: {utt}")
-        data = extract_file_json(utt) or {}
-        print(f"  extracted: {data}")
-        query = (data.get("query") or "").strip() or utt
-        matches = file_manager.search_file(query)
-        dest = data.get("destination")
-        resolved = file_manager.resolve_destination(dest) if dest else None
-        print(f"  destination={dest!r}  resolved={resolved!r}")
-        print(f"  matches ({len(matches)}):")
-        for m in matches:
-            marker = " [PROTECTED!]" if file_manager.is_protected_path(m) else ""
-            print(f"    - {m}{marker}")
-        passed, why = check(matches)
-        if passed:
-            print("  ok")
-            ok += 1
-        else:
-            print(f"  FAIL — {why}")
-            bad += 1
-        print()
-
-    print(f"summary: {ok} ok / {bad} fail")
+    # Round 1 — live Spotlight. Round 2 — Spotlight-blind (simulated
+    # TCC): force mdfind to return nothing so only the filesystem-walk
+    # fallback can find files. Every case that passes Round 1 must also
+    # pass Round 2 or Jarvis will be useless inside JarvisApp.
+    ok1, bad1 = _run_cases("ROUND 1 — live Spotlight", CASES, spotlight_blind=False)
+    ok2, bad2 = _run_cases("ROUND 2 — Spotlight-blind (TCC simulation)", CASES, spotlight_blind=True)
+    ok = ok1 + ok2
+    bad = bad1 + bad2
+    print(f"summary: round1 {ok1} ok / {bad1} fail  |  round2 {ok2} ok / {bad2} fail  "
+          f"|  total {ok} ok / {bad} fail")
     sys.exit(0 if bad == 0 else 1)
 
 
