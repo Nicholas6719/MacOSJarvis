@@ -170,34 +170,46 @@ def close_tab() -> None:
     _run_osa(script)
 
 
-def go_back() -> None:
-    """Trigger the browser Back action in Brave via Cmd+Left."""
-    _ensure_brave_frontmost()
-    _run_osa(
-        'tell application "System Events" to key code 123 using {command down}'
+def _execute_js(js: str) -> None:
+    """Run JavaScript inside Brave's active tab.
+
+    Uses Brave's `execute javascript` AppleScript command. This does NOT
+    require macOS Accessibility permission (unlike System Events
+    keystrokes) because the command goes through AppleEvents directly to
+    Brave. It DOES require the user to enable, once:
+        Brave → View → Developer → Allow JavaScript from Apple Events
+    Without that toggle, the command raises a RuntimeError with a
+    recognizable message so the caller can speak a clear hint.
+    """
+    _ensure_brave_running()
+    script = (
+        f'tell application "{_APP_NAME}"\n'
+        f'  if (count of windows) = 0 then return\n'
+        f'  tell active tab of front window to execute javascript "{_escape(js)}"\n'
+        f'end tell\n'
     )
+    _run_osa(script)
+
+
+def go_back() -> None:
+    """Trigger the browser Back action via `history.back()` in Brave's
+    active tab. Works even when Brave is not frontmost."""
+    _execute_js("history.back();")
 
 
 def go_forward() -> None:
-    """Trigger the browser Forward action in Brave via Cmd+Right."""
-    _ensure_brave_frontmost()
-    _run_osa(
-        'tell application "System Events" to key code 124 using {command down}'
-    )
+    """Trigger the browser Forward action via `history.forward()`."""
+    _execute_js("history.forward();")
 
 
 def scroll_down() -> None:
-    """Scroll the active page down by one screen (Page Down keystroke)."""
-    _ensure_brave_frontmost()
-    # Key code 121 = Page Down on US keyboards.
-    _run_osa('tell application "System Events" to key code 121')
+    """Scroll the active Brave tab down by one screen via window.scrollBy."""
+    _execute_js("window.scrollBy(0, window.innerHeight);")
 
 
 def scroll_up() -> None:
-    """Scroll the active page up by one screen (Page Up keystroke)."""
-    _ensure_brave_frontmost()
-    # Key code 116 = Page Up.
-    _run_osa('tell application "System Events" to key code 116')
+    """Scroll the active Brave tab up by one screen via window.scrollBy."""
+    _execute_js("window.scrollBy(0, -window.innerHeight);")
 
 
 def get_current_url() -> str:
