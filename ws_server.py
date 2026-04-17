@@ -146,6 +146,49 @@ def _handle_api_status(handler: http.server.BaseHTTPRequestHandler) -> None:
     handler.wfile.write(body)
 
 
+def _handle_preview_file(handler: http.server.BaseHTTPRequestHandler) -> None:
+    """Serve the file currently staged by file_manager.prepare_preview().
+    Only one preview file is active at a time — the path is owned by
+    file_manager and advances as the user confirms or rejects files."""
+    try:
+        import file_manager  # local import to avoid cycle at module load
+    except Exception as e:
+        handler.send_error(500, f"preview unavailable: {e}")
+        return
+    path = file_manager.get_active_preview_path()
+    if not path or not os.path.isfile(path):
+        handler.send_error(404, "no active preview")
+        return
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except Exception as e:
+        handler.send_error(500, f"preview read error: {e}")
+        return
+
+    ext = os.path.splitext(path)[1].lower()
+    mime = {
+        ".pdf":  "application/pdf",
+        ".png":  "image/png",
+        ".jpg":  "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif":  "image/gif",
+        ".webp": "image/webp",
+        ".bmp":  "image/bmp",
+        ".heic": "image/heic",
+        ".tiff": "image/tiff",
+        ".svg":  "image/svg+xml",
+        ".txt":  "text/plain; charset=utf-8",
+    }.get(ext, "application/octet-stream")
+
+    handler.send_response(200)
+    handler.send_header("Content-Type", mime)
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Content-Disposition", "inline")
+    _cors_end_headers(handler)
+    handler.wfile.write(data)
+
+
 def _handle_api_mute(handler: http.server.BaseHTTPRequestHandler) -> None:
     length = int(handler.headers.get("Content-Length", "0"))
     raw = handler.rfile.read(length) if length > 0 else b"{}"
@@ -172,10 +215,14 @@ class _APIOnlyHandler(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path.split("?", 1)[0] == "/api/status":
+        path0 = self.path.split("?", 1)[0]
+        if path0 == "/api/status":
             _handle_api_status(self)
             return
-        if self.path.split("?", 1)[0] in ("/", "/index.html"):
+        if path0 == "/preview_file":
+            _handle_preview_file(self)
+            return
+        if path0 in ("/", "/index.html"):
             html = (
                 "<!DOCTYPE html><html><head><meta charset=\"utf-8\"/><title>Jarvis</title></head>"
                 "<body style=\"font-family:system-ui;padding:2rem\">"
@@ -226,8 +273,12 @@ def _serve_http() -> None:
             pass
 
         def do_GET(self):
-            if self.path.split("?", 1)[0] == "/api/status":
+            path0 = self.path.split("?", 1)[0]
+            if path0 == "/api/status":
                 _handle_api_status(self)
+                return
+            if path0 == "/preview_file":
+                _handle_preview_file(self)
                 return
             super().do_GET()
 

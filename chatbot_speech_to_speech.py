@@ -32,6 +32,7 @@ from openwakeword.model import Model as WakeWordModel
 
 import ws_server
 import calendar_reminders
+import file_manager
 
 from memory import MemoryManager
 memory = MemoryManager()
@@ -252,6 +253,19 @@ class VoiceAssistant:
         # (not module-level) so it dies with the VoiceAssistant and
         # cannot leak across restarts.
         self._pending_calendar_action: Optional[dict] = None
+
+        # ── File manager state ──────────────────────────────────────────
+        # _pending_file_action holds a pending confirmation (or
+        # disambiguation between multiple matches). The next user
+        # utterance answers it — not a new command. Structure:
+        #   {"action": "move"|"rename"|"describe",
+        #    "original_path": "...",
+        #    "destination": "...",  # move
+        #    "new_name": "...",     # rename
+        #    "temp_preview_path": "..." or None,
+        #    "candidates": [...remaining paths...],
+        #    "waiting_for": "confirmation"|"selection"}
+        self._pending_file_action: Optional[dict] = None
 
         # Wake word state
         self._in_conversation = False
@@ -2620,6 +2634,413 @@ class VoiceAssistant:
         threading.Thread(target=_finish, daemon=True,
                          name="calendar-resume").start()
 
+    # ── File management ───────────────────────────────────────────────────
+    #
+    # Voice-driven file find/move/rename/describe. Jarvis always shows
+    # the candidate file in the orb (or Quick Look, if the flag is
+    # flipped) and confirms verbally before doing anything destructive.
+    # The "describe" path is the exception — it's read-only and never
+    # confirms.
+
+    # Words Jarvis treats as confirmation when a file-action is pending.
+    _FILE_YES_WORDS = (
+        "yes", "yeah", "yep", "yup", "sure", "correct", "right", "that's it",
+        "thats it", "do it", "go ahead", "confirm", "affirmative", "please do",
+        "that one", "this one", "ok", "okay",
+    )
+    _FILE_NO_WORDS = (
+        "no", "nope", "nah", "wrong", "wrong file", "not that", "not that one",
+        "not it", "cancel", "never mind", "nevermind", "stop", "abort",
+    )
+
+    def _detect_file_intent(self, text: str) -> Optional[str]:
+        """Return one of file_move / file_rename / file_describe /
+        file_find, or None if no file-management intent is present."""
+        t = (text or "").lower().strip()
+        if not t:
+            return None
+
+        has_file_noun = bool(re.search(
+            r"\b(file|document|doc|pdf|image|picture|photo|spreadsheet|"
+            r"resume|presentation|slides|note|notes|word\s+doc|"
+            r"word\s+document)\b", t
+        ))
+        has_file_ext = bool(re.search(
+            r"\.(?:pdf|docx?|txt|md|png|jpe?g|gif|heic|tiff|bmp|csv|xlsx?|pptx?)\b",
+            t,
+        ))
+        file_ref = has_file_noun or has_file_ext
+
+        # Rename — strong, unambiguous phrasing. Allow with or without
+        # "file"/"document" because "rename X to Y" is itself a clear
+        # file operation.
+        if re.search(r"\brename\b", t) or \
+           re.search(r"\bchange\s+the\s+name\s+of\b", t):
+            return "file_rename"
+
+        # Move / put / transfer / send a file to a location.
+        if file_ref and re.search(
+            r"\b(?:move|put|transfer|send|drop|relocate)\b[^.?!]*?\b"
+            r"(?:to|into|onto|on|in)\b",
+            t,
+        ):
+            return "file_move"
+
+        # Describe / read / summarize a file.
+        if file_ref and (
+            re.search(r"\b(?:summarize|summarise|describe|read\s+(?:me\s+)?"
+                      r"(?:through\s+)?(?:out\s+)?(?:aloud\s+)?)\b", t)
+            or re.search(r"\bwhat(?:'?s|\s+is|\s+does)\s+(?:in|inside)\b", t)
+            or re.search(r"\btell\s+me\s+what(?:'?s|\s+is)\s+(?:in|inside)\b", t)
+            or re.search(r"\bopen\s+and\s+read\b", t)
+        ):
+            return "file_describe"
+
+        # Find / locate a file.
+        if re.search(r"\b(?:find|locate|where\s+is|where(?:'?s)?)\b", t) and file_ref:
+            return "file_find"
+        if re.search(r"\b(?:can\s+you\s+)?find\s+(?:me\s+)?(?:my\s+|the\s+)?", t) and file_ref:
+            return "file_find"
+
+        return None
+
+    def _extract_file_json(self, utterance: str) -> Optional[dict]:
+        """LLM-extracted details for a file-management utterance. Returns
+        a dict with query / action / destination / new_name, or None."""
+        prompt = (
+            "Extract file management details from this voice request. "
+            "Respond in JSON only — no explanation, no markdown. "
+            "Fields: query (the filename or description the user gave), "
+            "action (move/rename/describe/find), "
+            "destination (string or null — where to move it, resolve "
+            "Desktop to /Users/nicholascoppola/Desktop, Documents to "
+            "/Users/nicholascoppola/Documents, Downloads to "
+            "/Users/nicholascoppola/Downloads, etc.), "
+            "new_name (string or null — for rename only). "
+            f"User said: '{utterance}'"
+        )
+        raw = self._llm_silent(
+            "You are a precise JSON extraction tool. Reply with valid JSON only.",
+            prompt,
+            max_tokens=180,
+            temperature=0.1,
+        )
+        if not raw:
+            return None
+        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+        raw = re.sub(r"\s*```\s*$", "", raw).strip()
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if m:
+            raw = m.group(0)
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            print(f"[File] JSON parse error: {e}  — raw: {raw!r}")
+            return None
+
+    def _push_file_preview(self, filepath: str, preview: dict) -> None:
+        """Send a preview event to the orb over the WebSocket."""
+        try:
+            event = {
+                "type": "file_preview",
+                "filename": Path(filepath).name,
+                "file_type": preview.get("file_type", "other"),
+                "mode": preview.get("mode", "orb"),
+                "serve_url": preview.get("serve_url"),
+                "text_content": preview.get("text_content"),
+                # Bump a nonce so the WebView re-fetches /preview_file
+                # instead of using a cached response from a prior file.
+                "cache_buster": int(time.time() * 1000),
+            }
+            ws_server.send_event(event)
+        except Exception as e:
+            print(f"[File] push preview error: {e}")
+
+    def _clear_file_preview(self) -> None:
+        """Tell the orb to hide the preview overlay."""
+        try:
+            ws_server.send_event({"type": "file_preview_clear"})
+        except Exception as e:
+            print(f"[File] clear preview error: {e}")
+
+    def _handle_file_command(self, intent: str, user_input: str) -> None:
+        """Top-level dispatch for a file-management utterance. Runs on the
+        main loop thread — operations are fast (mdfind + preview prep).
+        Any exception is caught and spoken so the pipeline never crashes."""
+        try:
+            data = self._extract_file_json(user_input) or {}
+            query = (data.get("query") or "").strip()
+            destination = data.get("destination")
+            new_name = data.get("new_name")
+
+            if not query:
+                # Fall back to the full utterance if the LLM gave us nothing.
+                query = re.sub(
+                    r"\b(?:please|jarvis|could\s+you|can\s+you|would\s+you)\b",
+                    "",
+                    user_input,
+                    flags=re.IGNORECASE,
+                ).strip()
+
+            matches = file_manager.search_file(query)
+            if not matches:
+                self.speak_direct(
+                    "I couldn't find anything matching that, Sir. "
+                    "Can you be more specific?"
+                )
+                return
+
+            if intent == "file_find":
+                self._handle_file_find(matches)
+                return
+
+            if intent == "file_describe":
+                self._handle_file_describe(matches[0])
+                return
+
+            # move / rename — require confirmation with preview.
+            action = "move" if intent == "file_move" else "rename"
+            resolved_dest = (
+                file_manager.resolve_destination(destination)
+                if action == "move" else None
+            )
+
+            if action == "move" and not resolved_dest:
+                self.speak_direct(
+                    "I didn't catch where you wanted me to move it, Sir. "
+                    "Try again with a destination."
+                )
+                return
+
+            if action == "rename" and not (new_name and str(new_name).strip()):
+                self.speak_direct(
+                    "I didn't catch what you wanted to rename it to, Sir."
+                )
+                return
+
+            self._present_file_for_confirmation(
+                action=action,
+                candidates=matches,
+                destination=resolved_dest,
+                new_name=new_name,
+            )
+        except Exception as e:
+            print(f"[File] handle command error: {e}")
+            import traceback
+            traceback.print_exc()
+            self._safe_speak(
+                "I ran into a problem handling that file request, Sir."
+            )
+
+    def _handle_file_find(self, matches: list[str]) -> None:
+        """Informational: show where the file is, no confirmation needed."""
+        if len(matches) == 1:
+            path = matches[0]
+            preview = file_manager.prepare_preview(path)
+            self._push_file_preview(path, preview)
+            folder = str(Path(path).parent.name) or "your home folder"
+            name = Path(path).name
+            # Give the orb a few seconds to render, then clear on the
+            # next user command. We don't auto-hide here — the user sees
+            # it until they move on.
+            self.speak_direct(
+                f"I found {name} in your {folder} folder, Sir."
+            )
+            # Track the temp path so we can clean it up when the preview
+            # is later dismissed or replaced.
+            self._pending_file_action = {
+                "action": "find",
+                "original_path": path,
+                "temp_preview_path": preview.get("temp_path"),
+                "candidates": [],
+                "waiting_for": None,
+            }
+            return
+
+        # Multiple: list the top matches verbally.
+        lines = []
+        for i, path in enumerate(matches[:5], start=1):
+            folder = str(Path(path).parent.name) or "home"
+            lines.append(f"{i}. {Path(path).name} in {folder}")
+        summary = "I found a few matches, Sir. " + ". ".join(lines) + "."
+        self.speak_direct(summary)
+
+    def _handle_file_describe(self, path: str) -> None:
+        """Read the file and speak a natural summary. No confirmation —
+        this is read-only."""
+        preview = file_manager.prepare_preview(path)
+        self._push_file_preview(path, preview)
+        # Build text content for the LLM from whatever prepare_preview
+        # gave us. For images / other, we just describe the metadata.
+        content_for_llm = preview.get("text_content") or ""
+        if not content_for_llm:
+            ft = preview.get("file_type", "other")
+            if ft == "pdf":
+                content_for_llm = f"[A PDF file named {Path(path).name}. Content not extracted.]"
+            elif ft == "image":
+                content_for_llm = f"[An image file named {Path(path).name}.]"
+            else:
+                content_for_llm = f"[A file named {Path(path).name}.]"
+        # Truncate so we don't blow the context window.
+        if len(content_for_llm) > 6000:
+            content_for_llm = content_for_llm[:6000] + "\n… (truncated)"
+
+        prompt = (
+            "The user asked what's in this file. Give a brief, natural, "
+            "spoken summary of the content — two to four sentences, "
+            "conversational, no bullet points, no markdown. If the file "
+            "is empty or unreadable, say so briefly.\n\n"
+            f"FILE: {Path(path).name}\n\nCONTENT:\n{content_for_llm}"
+        )
+        text = self._llm_silent(self._JARVIS_CAL_SYSTEM, prompt, max_tokens=260)
+        if text:
+            self._safe_speak(text)
+        else:
+            self._safe_speak(f"I wasn't able to summarize {Path(path).name}, Sir.")
+
+        # Record so a follow-up utterance clears the preview cleanly.
+        self._pending_file_action = {
+            "action": "describe",
+            "original_path": path,
+            "temp_preview_path": preview.get("temp_path"),
+            "candidates": [],
+            "waiting_for": None,
+        }
+
+    def _present_file_for_confirmation(
+        self,
+        action: str,
+        candidates: list[str],
+        destination: Optional[str] = None,
+        new_name: Optional[str] = None,
+    ) -> None:
+        """Prep the top candidate's preview, push it to the orb, stash
+        the pending action, and ask for confirmation verbally."""
+        if not candidates:
+            self._safe_speak(
+                "I couldn't find the right file, Sir. Try describing it differently."
+            )
+            return
+
+        path = candidates[0]
+        remaining = candidates[1:]
+        preview = file_manager.prepare_preview(path)
+        self._push_file_preview(path, preview)
+
+        self._pending_file_action = {
+            "action": action,
+            "original_path": path,
+            "destination": destination,
+            "new_name": new_name,
+            "temp_preview_path": preview.get("temp_path"),
+            "candidates": remaining,
+            "waiting_for": "confirmation",
+        }
+
+        folder = str(Path(path).parent.name) or "your home folder"
+        name = Path(path).name
+        if action == "move":
+            dest_label = self._dest_label(destination or "")
+            question = (
+                f"I found {name} in your {folder} folder. "
+                f"Is this the one you want to move to the {dest_label}, Sir?"
+            )
+        else:  # rename
+            question = (
+                f"I found {name} in your {folder} folder. "
+                f"Should I rename this one to {new_name}, Sir?"
+            )
+        self.speak_direct(question)
+
+    @staticmethod
+    def _dest_label(destination: str) -> str:
+        """Turn an absolute path into a short spoken label."""
+        if not destination:
+            return "destination"
+        name = Path(destination).name
+        return name or destination
+
+    def _resume_pending_file_action(self, answer: str) -> None:
+        """Process the user's yes/no for the most recent file confirmation.
+        On no, walk through any remaining candidates."""
+        pending = self._pending_file_action
+        if not pending:
+            return
+
+        # Read-only pending states (find/describe) — any new utterance
+        # just clears the preview; re-dispatch the utterance as a normal
+        # command.
+        if pending.get("waiting_for") is None:
+            cleanup = pending.get("temp_preview_path")
+            file_manager.cleanup_temp_preview(cleanup)
+            self._clear_file_preview()
+            self._pending_file_action = None
+            # NOTE: caller handles re-dispatch; we just cleared state.
+            return
+
+        t = (answer or "").lower().strip().rstrip(".?!,;:")
+        is_yes = any(re.search(rf"\b{re.escape(w)}\b", t) for w in self._FILE_YES_WORDS)
+        is_no = any(re.search(rf"\b{re.escape(w)}\b", t) for w in self._FILE_NO_WORDS)
+
+        if is_yes and not is_no:
+            self._execute_pending_file_action(pending)
+            return
+
+        if is_no or not is_yes:
+            # Treat anything that isn't an explicit yes as a no so we
+            # don't silently destroy the wrong file.
+            cleanup = pending.get("temp_preview_path")
+            file_manager.cleanup_temp_preview(cleanup)
+            self._pending_file_action = None
+
+            remaining = pending.get("candidates") or []
+            if remaining:
+                self._present_file_for_confirmation(
+                    action=pending["action"],
+                    candidates=remaining,
+                    destination=pending.get("destination"),
+                    new_name=pending.get("new_name"),
+                )
+            else:
+                self._clear_file_preview()
+                self._safe_speak(
+                    "I couldn't find the right file, Sir. "
+                    "Try describing it differently."
+                )
+
+    def _execute_pending_file_action(self, pending: dict) -> None:
+        """Run the actual move or rename, clean up temp, clear state."""
+        action = pending.get("action")
+        original_path = pending.get("original_path") or ""
+        temp_path = pending.get("temp_preview_path")
+
+        # Always clean up the temp preview first — we never want to
+        # touch the original file by accident.
+        file_manager.cleanup_temp_preview(temp_path)
+        self._pending_file_action = None
+        self._clear_file_preview()
+
+        if action == "move":
+            destination = pending.get("destination") or ""
+            ok, msg = file_manager.move_file(original_path, destination)
+            if ok:
+                dest_label = self._dest_label(destination)
+                self._safe_speak(f"Done, Sir — moved it to the {dest_label}.")
+            else:
+                self._safe_speak(f"I wasn't able to move that file, Sir. {msg}.")
+            return
+
+        if action == "rename":
+            new_name = pending.get("new_name") or ""
+            ok, msg = file_manager.rename_file(original_path, str(new_name))
+            if ok:
+                self._safe_speak(f"Done, Sir — renamed to {Path(msg).name}.")
+            else:
+                self._safe_speak(f"I wasn't able to rename that file, Sir. {msg}.")
+            return
+
+        self._safe_speak("I'm not sure what to do with that, Sir.")
+
     # ── Spinner ───────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -3200,6 +3621,22 @@ class VoiceAssistant:
                     print()
                     continue
 
+                # Pending file confirmation — the next utterance answers
+                # "is this the file you want to move?" rather than being
+                # a new command. Find/describe live in this state too,
+                # but their waiting_for is None so the resume helper just
+                # clears the preview and we fall through to handle the
+                # new utterance normally.
+                if self._pending_file_action is not None:
+                    waiting_for = self._pending_file_action.get("waiting_for")
+                    if waiting_for == "confirmation":
+                        self._resume_pending_file_action(user_input)
+                        print()
+                        continue
+                    # Read-only pending (find/describe) — dismiss preview
+                    # and keep processing the new utterance below.
+                    self._resume_pending_file_action(user_input)
+
                 remember_fact = memory.detect_remember_command(user_input)
                 if remember_fact:
                     fact_key = "user_note_" + str(int(time.time()))
@@ -3298,9 +3735,10 @@ class VoiceAssistant:
                 # Clipboard augmentation
                 augmented_input, is_clipboard = self._try_augment_clipboard(user_input)
 
-                # System command, calendar intent, or LLM
+                # System command, calendar intent, file intent, or LLM
                 sys_response = self._handle_system_command(user_input)
                 cal_intent = None
+                file_intent = None
                 if not sys_response:
                     # Only probe calendar intent when no system command
                     # matched — keeps timer-style reminders ("remind me in
@@ -3308,6 +3746,8 @@ class VoiceAssistant:
                     # detection is strict regex only; casual chat falls
                     # through to None.
                     cal_intent = self._detect_calendar_intent(user_input)
+                    if cal_intent is None:
+                        file_intent = self._detect_file_intent(user_input)
 
                 if sys_response and sys_response != WAKE_MODE_SENTINEL:
                     print(f"System: {sys_response}")
@@ -3320,6 +3760,9 @@ class VoiceAssistant:
                     # Main loop will idle on _calendar_working until the
                     # worker finishes.
                     self._handle_calendar_command(cal_intent, user_input)
+                elif file_intent is not None:
+                    print(f"[File] Intent: {file_intent}")
+                    self._handle_file_command(file_intent, user_input)
                 else:
                     # Build the one-turn memory context block if we have search hits.
                     memory_context: Optional[str] = None

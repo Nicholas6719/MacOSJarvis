@@ -23,6 +23,9 @@ const badgeLabelEl = document.getElementById(
   "connection-label"
 ) as HTMLSpanElement;
 const muteButtonEl = document.getElementById("mute-button") as HTMLButtonElement;
+const previewEl = document.getElementById("file-preview") as HTMLDivElement;
+const previewNameEl = document.getElementById("file-preview-name") as HTMLDivElement;
+const previewBodyEl = document.getElementById("file-preview-body") as HTMLDivElement;
 
 // ── Orb ───────────────────────────────────────────────────────────────────────
 const orb = createOrb(canvas);
@@ -107,6 +110,58 @@ async function toggleMuted(): Promise<void> {
   }
 }
 
+// ── File preview overlay ──────────────────────────────────────────────────────
+interface FilePreviewEvent {
+  type?: string;
+  filename?: string;
+  file_type?: string;
+  mode?: string;
+  serve_url?: string | null;
+  text_content?: string | null;
+  cache_buster?: number;
+}
+
+function hideFilePreview(): void {
+  previewEl.hidden = true;
+  previewNameEl.textContent = "";
+  previewBodyEl.replaceChildren();
+}
+
+function showFilePreview(e: FilePreviewEvent): void {
+  const filename = e.filename || "file";
+  previewNameEl.textContent = filename;
+  previewBodyEl.replaceChildren();
+
+  // Quick Look mode: no inline rendering — native macOS preview window
+  // is already open. Keep the orb overlay hidden so the user isn't
+  // shown two competing views.
+  if (e.mode === "quicklook") {
+    previewEl.hidden = true;
+    return;
+  }
+
+  const ft = e.file_type || "other";
+  const bust = e.cache_buster ? `?v=${e.cache_buster}` : "";
+  const serveUrl = e.serve_url ? `${e.serve_url}${bust}` : null;
+
+  if ((ft === "pdf") && serveUrl) {
+    const iframe = document.createElement("iframe");
+    iframe.src = serveUrl;
+    previewBodyEl.appendChild(iframe);
+  } else if (ft === "image" && serveUrl) {
+    const img = document.createElement("img");
+    img.src = serveUrl;
+    img.alt = filename;
+    previewBodyEl.appendChild(img);
+  } else {
+    // text / other — inline text card
+    const pre = document.createElement("pre");
+    pre.textContent = e.text_content || "(no preview available)";
+    previewBodyEl.appendChild(pre);
+  }
+  previewEl.hidden = false;
+}
+
 // ── WebSocket with auto-reconnect ─────────────────────────────────────────────
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -129,9 +184,18 @@ function connect(): void {
         state?: string;
         muted?: boolean;
         action?: string;
-      };
+        type?: string;
+      } & FilePreviewEvent;
       if (data.action === "demo") {
         orb.triggerDemo();
+        return;
+      }
+      if (data.type === "file_preview") {
+        showFilePreview(data);
+        return;
+      }
+      if (data.type === "file_preview_clear") {
+        hideFilePreview();
         return;
       }
       if (data.state) {
@@ -148,6 +212,7 @@ function connect(): void {
   ws.addEventListener("close", () => {
     setConnected(false);
     applyState("idle");
+    hideFilePreview();
     scheduleReconnect();
   });
 
