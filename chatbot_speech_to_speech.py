@@ -1459,8 +1459,24 @@ class VoiceAssistant:
             return "delete_reminder"
 
         # Update a reminder — reschedule, rename, change notes.
+        # Two phrasings:
+        # (a) explicit "reminder" keyword ("reschedule the grocery reminder")
+        # (b) implicit — "reschedule X to <date/time>" with no "reminder"
+        #     word. Catches the case where the reminder's title already
+        #     contains a schedule verb ("reschedule test the reschedule to
+        #     the 19th at 10 am") so the user naturally skips the word.
+        _DATE_OR_TIME_SUFFIX = (
+            r"\b(?:\d{1,2}(?:st|nd|rd|th)?|"
+            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+            r"tomorrow|today|tonight|this\s+\w+|next\s+\w+)"
+            r"|at\s+\d|\d{1,2}\s*(?:am|pm|a\.m|p\.m)"
+        )
         if re.search(r"\b(?:reschedule|move|change|update|edit|rename)\s+(?:the\s+)?[^.?!]*?\breminder\b", t) or \
-           re.search(r"\b(?:change|update|move)\s+(?:the\s+)?reminder\b", t):
+           re.search(r"\b(?:change|update|move)\s+(?:the\s+)?reminder\b", t) or \
+           re.search(
+               r"\b(?:reschedule|move)\b[^.?!]{2,60}?\bto\b[^.?!]{0,30}?" + _DATE_OR_TIME_SUFFIX,
+               t,
+           ):
             return "update_reminder"
 
         # Delete a calendar event.
@@ -1898,17 +1914,34 @@ class VoiceAssistant:
             "These are the user's open reminders, listed in chronological "
             "order — earliest due date first. Summarize them naturally and "
             "conversationally in Jarvis's voice — not a list, not a script, "
-            "just how a sharp assistant would say them out loud. "
-            "IMPORTANT: mention the reminders in the exact order they are "
-            "given below (earliest due date first, latest last). Do not "
-            "rearrange them. Keep it brief, two to four sentences.\n\n"
+            "just how a sharp assistant would say them out loud.\n\n"
+            "CRITICAL RULES:\n"
+            "- Mention the reminders in the exact order given below. Do not rearrange.\n"
+            "- Read each due date and time EXACTLY as written in the input. Do not "
+            "change AM to PM or vice versa. Do not change the hour. Do not round. "
+            "'8 PM' means 8 PM, not 9 AM or 8 AM.\n"
+            "- Keep it brief, two to four sentences.\n\n"
             + "\n".join(lines)
         )
         text = self._llm_silent(self._JARVIS_CAL_SYSTEM, prompt, max_tokens=220)
         if text:
             self._safe_speak(text)
         else:
-            self._safe_speak("I had trouble summarizing your reminders, Sir.")
+            # Template fallback — deterministic, never hallucinates times.
+            if len(reminders) == 1:
+                r = reminders[0]
+                if r.get("due"):
+                    self._safe_speak(f"You have one open reminder, Sir: {r['title']}, due {r['due']}.")
+                else:
+                    self._safe_speak(f"You have one open reminder, Sir: {r['title']}.")
+            else:
+                parts = [f"You have {len(reminders)} open reminders, Sir."]
+                for r in reminders:
+                    if r.get("due"):
+                        parts.append(f"{r['title']} is due {r['due']}.")
+                    else:
+                        parts.append(f"{r['title']}.")
+                self._safe_speak(" ".join(parts))
 
     def _format_event_lines(self, events: list) -> list:
         lines = []
@@ -2152,10 +2185,23 @@ class VoiceAssistant:
             )
             return
 
+        # The LLM sometimes returns the STRING "null" instead of JSON null
+        # for fields it doesn't have a value for. Without filtering, that
+        # string lands in the reminder's body and shows up as a literal
+        # "null" under the reminder title in Reminders.app — exactly what
+        # Nicholas saw on his "Test the reschedule" reminder.
+        def _clean_optional(value):
+            if value is None:
+                return None
+            s = str(value).strip()
+            if s.lower() in ("null", "none", "n/a", "na", "nil", ""):
+                return None
+            return s
+
         title = (data_json.get("title") or "Reminder").strip()
-        notes = data_json.get("notes")
-        date_field = data_json.get("date")
-        start_time = data_json.get("start_time")
+        notes = _clean_optional(data_json.get("notes"))
+        date_field = _clean_optional(data_json.get("date"))
+        start_time = _clean_optional(data_json.get("start_time"))
 
         due_dt: Optional[datetime.datetime] = None
         if date_field or start_time:
