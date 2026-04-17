@@ -151,10 +151,6 @@ def test_feature_6() -> None:
     _run_and_check("new_tab('https://example.com')",
                    lambda: bc.new_tab("https://example.com"))
     _run_and_check("close_tab()", bc.close_tab)
-    _run_and_check("go_back()", bc.go_back)
-    _run_and_check("go_forward()", bc.go_forward)
-    _run_and_check("scroll_down()", bc.scroll_down)
-    _run_and_check("scroll_up()", bc.scroll_up)
 
 
 # ── Feature 7: notification monitor helpers ────────────────────────────────

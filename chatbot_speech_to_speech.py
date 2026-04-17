@@ -971,13 +971,6 @@ class VoiceAssistant:
         r"\bwhat(?:'?s|\s+is)\s+(?:my\s+)?browser\s+(?:on|showing)\b",
     )
 
-    def _brave_is_frontmost(self) -> bool:
-        """True if Brave Browser is currently the frontmost app."""
-        try:
-            return browser_control._is_brave_frontmost()
-        except Exception:
-            return False
-
     def _handle_browser_command(self, t: str) -> Optional[str]:
         """If `t` (already lowercased) is a browser command, execute it and
         return the spoken response. Otherwise return None.
@@ -1015,41 +1008,6 @@ class VoiceAssistant:
                 return "Closed the tab, Sir."
             except Exception as e:
                 return f"I couldn't close the tab, Sir. ({e})"
-
-        # ── Back / forward ────────────────────────────────────────────────
-        # Implemented via `execute javascript` inside Brave (no keystrokes,
-        # no Accessibility permission required). Still gated on Brave being
-        # frontmost so "go back" in a music context still skips tracks.
-        if re.search(r"\b(?:go\s+forward|forward)\b", t) and self._brave_is_frontmost():
-            try:
-                browser_control.go_forward()
-                return "Going forward, Sir."
-            except Exception as e:
-                return self._browser_js_error("navigate forward", e)
-
-        if re.search(r"\b(?:go\s+back|back)\b", t) and self._brave_is_frontmost():
-            try:
-                browser_control.go_back()
-                return "Going back, Sir."
-            except Exception as e:
-                return self._browser_js_error("navigate back", e)
-
-        # ── Scroll ────────────────────────────────────────────────────────
-        # Scroll phrases are unambiguous — fire even when Brave isn't
-        # frontmost, since `execute javascript` doesn't need focus.
-        if re.search(r"\b(?:scroll\s+down|page\s+down)\b", t):
-            try:
-                browser_control.scroll_down()
-                return "Scrolling down, Sir."
-            except Exception as e:
-                return self._browser_js_error("scroll", e)
-
-        if re.search(r"\b(?:scroll\s+up|page\s+up)\b", t):
-            try:
-                browser_control.scroll_up()
-                return "Scrolling up, Sir."
-            except Exception as e:
-                return self._browser_js_error("scroll", e)
 
         # ── Navigate / open / search ──────────────────────────────────────
         # "search for <query>" always means Google search in the browser.
@@ -1104,26 +1062,6 @@ class VoiceAssistant:
                     return f"I couldn't open Brave, Sir. ({e})"
 
         return None
-
-    def _browser_js_error(self, action: str, exc: Exception) -> str:
-        """Format a speakable error for a failed Brave JS command. If the
-        failure looks like the one-time 'Allow JavaScript from Apple
-        Events' toggle is off, coach the user instead of reading the raw
-        AppleScript error."""
-        msg = str(exc).lower()
-        if (
-            "javascript through apple events" in msg
-            or "allow javascript from apple events" in msg
-            or "not allowed to send apple events" in msg
-            or "applescript execution is disabled" in msg
-            or "-1743" in msg
-        ):
-            return (
-                f"I couldn't {action}, Sir — Brave is blocking JavaScript "
-                "from Apple Events. Enable 'Allow JavaScript from Apple "
-                "Events' in Brave's View, Developer menu."
-            )
-        return f"I couldn't {action}, Sir."
 
     def _browser_open_confirmation(self, spoken_site: str, url: str) -> str:
         """Pick a natural confirmation for an open/navigate command."""
