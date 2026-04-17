@@ -2673,23 +2673,41 @@ class VoiceAssistant:
 
         # Rename — strong, unambiguous phrasing. Allow with or without
         # "file"/"document" because "rename X to Y" is itself a clear
-        # file operation.
-        if re.search(r"\brename\b", t) or \
+        # file operation. Catch past/progressive tenses so a follow-up
+        # like "actually rename it to X" still routes correctly.
+        if re.search(r"\b(?:rename|renamed|renaming|renames)\b", t) or \
            re.search(r"\bchange\s+the\s+name\s+of\b", t):
             return "file_rename"
 
-        # Move / put / transfer / send a file to a location.
+        # Move / put / transfer / send / take / stick a file to a location.
+        # All tenses — STT sometimes transcribes "move" as "moved", and
+        # the user may naturally say "actually moved that to Documents"
+        # intending an imperative. file_ref guards against false
+        # positives from unrelated sentences.
+        _MOVE_VERBS = (
+            r"\b(?:"
+            r"move[sd]?|moving|"
+            r"put(?:s|ting)?|"
+            r"transfer(?:s|red|ring)?|"
+            r"send(?:s|ing)?|sent|"
+            r"drop(?:s|ped|ping)?|"
+            r"relocate[sd]?|relocating|"
+            r"take[sn]?|taking|took|"
+            r"stick(?:s|ing)?|stuck|"
+            r"copy|copied|copying|copies"
+            r")\b"
+        )
         if file_ref and re.search(
-            r"\b(?:move|put|transfer|send|drop|relocate)\b[^.?!]*?\b"
-            r"(?:to|into|onto|on|in)\b",
+            _MOVE_VERBS + r"[^.?!]*?\b(?:to|into|onto|on|in)\b",
             t,
         ):
             return "file_move"
 
         # Describe / read / summarize a file.
         if file_ref and (
-            re.search(r"\b(?:summarize|summarise|describe|read\s+(?:me\s+)?"
-                      r"(?:through\s+)?(?:out\s+)?(?:aloud\s+)?)\b", t)
+            re.search(r"\b(?:summarize|summarise|summarizing|summarized|"
+                      r"describe[sd]?|describing|"
+                      r"read\s+(?:me\s+)?(?:through\s+)?(?:out\s+)?(?:aloud\s+)?)\b", t)
             or re.search(r"\bwhat(?:'?s|\s+is|\s+does)\s+(?:in|inside)\b", t)
             or re.search(r"\btell\s+me\s+what(?:'?s|\s+is)\s+(?:in|inside)\b", t)
             or re.search(r"\bopen\s+and\s+read\b", t)
@@ -2697,7 +2715,8 @@ class VoiceAssistant:
             return "file_describe"
 
         # Find / locate a file.
-        if re.search(r"\b(?:find|locate|where\s+is|where(?:'?s)?)\b", t) and file_ref:
+        if re.search(r"\b(?:find|finds|finding|located?|locating|"
+                     r"where\s+is|where(?:'?s)?)\b", t) and file_ref:
             return "file_find"
         if re.search(r"\b(?:can\s+you\s+)?find\s+(?:me\s+)?(?:my\s+|the\s+)?", t) and file_ref:
             return "file_find"

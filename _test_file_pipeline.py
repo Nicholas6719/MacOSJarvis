@@ -150,6 +150,13 @@ CASES = [
     ("Find my RMV file", _has_rmv),
     ("What's in the RMV file on my desktop", _has_rmv),
     ("Rename the rmv file to license application", _has_rmv),
+    # Follow-up phrasings where the verb is past/progressive tense —
+    # common when the user is correcting themselves after a prior move.
+    # All of these must still yield RMV even via the extraction -> search.
+    ("Actually Jarvis moved the rmv file to my documents folder", _has_rmv),
+    ("Moved the rmv file to my documents", _has_rmv),
+    ("Put the RMV file on my desktop", _has_rmv),
+    ("Take the rmv file and put it in Downloads", _has_rmv),
     # Regression — Jarvis must not suggest its own memory.db, config, etc.
     ("Move my Jarvis file to Downloads",        _no_protected),
     ("Move the Jarvis memory file to Desktop",  _no_protected),
