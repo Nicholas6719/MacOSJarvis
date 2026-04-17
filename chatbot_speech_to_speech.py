@@ -33,6 +33,123 @@ from openwakeword.model import Model as WakeWordModel
 import ws_server
 import calendar_reminders
 import file_manager
+import browser_control
+
+# Set of known spoken site names from browser_control, used to decide
+# whether a bare "open X" utterance should route to Brave vs the Mac app
+# launcher. Lowercased for case-insensitive matching.
+_BROWSER_KNOWN_SITE_KEYS = set(browser_control._KNOWN_SITES.keys())
+
+
+# ── Feature 7: proactive notification state (module-level) ────────────────
+# These sets dedupe notifications across the lifetime of the process so
+# Jarvis never announces the same event or reminder twice in one day.
+# Event keys look like "<title>|<YYYY-MM-DD>"; reminder keys look like
+# "<title>|<ISO due timestamp>" so the same title on different days still
+# fires, but the same due time never fires twice.
+announced_event_notifications: set = set()
+announced_reminder_notifications: set = set()
+
+# Poll cadence for the notification monitor thread. 60s matches the spec:
+# calendar and reminders both resolve at minute precision.
+_NOTIFICATION_POLL_INTERVAL_S = 60
+# Calendar events announce when they're between these many minutes away.
+# 9-11 is deliberately inclusive of 10 minutes from either side of a poll
+# so a once-a-minute poll doesn't miss the 10-minute mark.
+_EVENT_NOTIFY_MIN_MINUTES = 9
+_EVENT_NOTIFY_MAX_MINUTES = 11
+
+
+def _parse_applescript_date(raw: str) -> Optional["datetime.datetime"]:
+    """Best-effort parse of AppleScript date strings like
+    'Friday, April 17, 2026 at 10:00:00 AM' into a Python datetime.
+    Returns None on any parse failure — callers should treat None as
+    'not announceable yet' rather than crashing the monitor thread."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    # Try the common AppleScript format first.
+    patterns = [
+        "%A, %B %d, %Y at %I:%M:%S %p",
+        "%A, %B %d, %Y at %I:%M %p",
+        "%a, %b %d, %Y at %I:%M:%S %p",
+        "%A %B %d %Y %I:%M:%S %p",
+    ]
+    for fmt in patterns:
+        try:
+            return datetime.datetime.strptime(raw, fmt)
+        except Exception:
+            continue
+    # The speech-formatter variant used by calendar_reminders for
+    # reminder 'due' strings: "Friday, April 17 at 10 AM" — no year.
+    today = datetime.date.today()
+    fallback_patterns = [
+        ("%A, %B %d at %I:%M %p", False),
+        ("%A, %B %d at %I %p", False),
+    ]
+    for fmt, _ in fallback_patterns:
+        try:
+            dt = datetime.datetime.strptime(raw, fmt)
+            return dt.replace(year=today.year)
+        except Exception:
+            continue
+    return None
+
+
+def _event_is_due_for_notification(
+    event: dict,
+    now: Optional["datetime.datetime"] = None,
+    announced: Optional[set] = None,
+) -> Optional[str]:
+    """If the event should be announced right now, return its dedup key.
+    Otherwise return None. Exposed at module level so tests can verify
+    the window logic without having to run the full monitor thread."""
+    if now is None:
+        now = datetime.datetime.now()
+    if announced is None:
+        announced = announced_event_notifications
+    title = (event.get("title") or "").strip()
+    start_raw = event.get("start") or ""
+    if not title or not start_raw:
+        return None
+    start_dt = _parse_applescript_date(start_raw)
+    if start_dt is None:
+        return None
+    delta = (start_dt - now).total_seconds() / 60.0
+    if not (_EVENT_NOTIFY_MIN_MINUTES <= delta <= _EVENT_NOTIFY_MAX_MINUTES):
+        return None
+    key = f"{title}|{start_dt.date().isoformat()}"
+    if key in announced:
+        return None
+    return key
+
+
+def _reminder_is_due_for_notification(
+    reminder: dict,
+    now: Optional["datetime.datetime"] = None,
+    announced: Optional[set] = None,
+) -> Optional[str]:
+    """If the reminder's due time falls inside the current minute and we
+    haven't already announced it, return its dedup key. Otherwise None."""
+    if now is None:
+        now = datetime.datetime.now()
+    if announced is None:
+        announced = announced_reminder_notifications
+    title = (reminder.get("title") or "").strip()
+    due_raw = reminder.get("due") or ""
+    if not title or not due_raw:
+        return None
+    due_dt = _parse_applescript_date(due_raw)
+    if due_dt is None:
+        return None
+    # Match at minute precision — same (year, month, day, hour, minute).
+    if (due_dt.year, due_dt.month, due_dt.day, due_dt.hour, due_dt.minute) != \
+       (now.year, now.month, now.day, now.hour, now.minute):
+        return None
+    key = f"{title}|{due_dt.isoformat(timespec='minutes')}"
+    if key in announced:
+        return None
+    return key
 
 from memory import MemoryManager
 memory = MemoryManager()
@@ -310,6 +427,18 @@ class VoiceAssistant:
         # Stashed at wake-fire time, consumed by the next record_audio call.
         self._pending_pre_wake_audio: bytes = b""
 
+        # ── Notification monitor (Feature 7) ─────────────────────────────
+        # A background thread polls Calendar and Reminders every 60s and
+        # queues proactive announcements when something is due. The speaker
+        # loop drains the queue, waits for any in-flight TTS to finish,
+        # respects the paused/muted state, then speaks via the existing
+        # TTS pipeline. Queue is unbounded — the announced_* sets prevent
+        # duplicate pile-ups.
+        self._notification_queue: queue.Queue = queue.Queue()
+        self._notification_monitor_thread: Optional[threading.Thread] = None
+        self._notification_speaker_thread: Optional[threading.Thread] = None
+        self._notification_stop = threading.Event()
+
     # ── Loading ───────────────────────────────────────────────────────────────
 
     def _load_llm(self) -> None:
@@ -578,6 +707,130 @@ class VoiceAssistant:
     def stop_speaking(self) -> None:
         self._stop_speak.set()
 
+    # ── Notification monitor (Feature 7) ─────────────────────────────────
+
+    def start_notification_monitor(self) -> None:
+        """Launch the background poll + speaker threads. Idempotent — if
+        the monitor is already running, this is a no-op."""
+        if (
+            self._notification_monitor_thread is not None
+            and self._notification_monitor_thread.is_alive()
+        ):
+            return
+        self._notification_stop.clear()
+        self._notification_monitor_thread = threading.Thread(
+            target=self._notification_monitor_loop,
+            daemon=True,
+            name="notification-monitor",
+        )
+        self._notification_speaker_thread = threading.Thread(
+            target=self._notification_speaker_loop,
+            daemon=True,
+            name="notification-speaker",
+        )
+        self._notification_monitor_thread.start()
+        self._notification_speaker_thread.start()
+        print("[Notify] monitor started", flush=True)
+
+    def stop_notification_monitor(self) -> None:
+        self._notification_stop.set()
+
+    def _notification_monitor_loop(self) -> None:
+        """Poll Calendar and Reminders on a fixed cadence. Any hits are
+        pushed onto _notification_queue for the speaker thread to drain."""
+        # Small startup delay so we don't collide with the first wake-word
+        # load and the initial calendar cold-launch.
+        for _ in range(20):
+            if self._notification_stop.is_set():
+                return
+            time.sleep(0.1)
+
+        while not self._notification_stop.is_set():
+            try:
+                self._check_calendar_notifications()
+            except Exception as e:
+                print(f"[Notify] calendar check error: {e}", flush=True)
+            try:
+                self._check_reminder_notifications()
+            except Exception as e:
+                print(f"[Notify] reminder check error: {e}", flush=True)
+            # Sleep in small chunks so stop requests are responsive.
+            for _ in range(_NOTIFICATION_POLL_INTERVAL_S * 10):
+                if self._notification_stop.is_set():
+                    return
+                time.sleep(0.1)
+
+    def _check_calendar_notifications(self) -> None:
+        try:
+            events = calendar_reminders.get_today_events()
+        except Exception as e:
+            print(f"[Notify] get_today_events failed: {e}", flush=True)
+            return
+        now = datetime.datetime.now()
+        for ev in events:
+            key = _event_is_due_for_notification(ev, now=now)
+            if key is None:
+                continue
+            announced_event_notifications.add(key)
+            title = ev.get("title", "your next event")
+            msg = f"Heads up — your {title} starts in 10 minutes, Sir."
+            self._notification_queue.put(msg)
+            print(f"[Notify] queued event notification: {title}", flush=True)
+
+    def _check_reminder_notifications(self) -> None:
+        try:
+            reminders = calendar_reminders.get_all_reminders()
+        except Exception as e:
+            print(f"[Notify] get_all_reminders failed: {e}", flush=True)
+            return
+        now = datetime.datetime.now()
+        for r in reminders:
+            key = _reminder_is_due_for_notification(r, now=now)
+            if key is None:
+                continue
+            announced_reminder_notifications.add(key)
+            title = r.get("title", "a reminder")
+            msg = f"Just a heads up — you wanted to remember to {title}, Sir."
+            self._notification_queue.put(msg)
+            print(f"[Notify] queued reminder notification: {title}", flush=True)
+
+    def _notification_speaker_loop(self) -> None:
+        """Drain the queue and speak each message. Waits for any current
+        TTS to finish and respects the paused/muted state — if Jarvis is
+        paused, the message stays queued until resume."""
+        while not self._notification_stop.is_set():
+            try:
+                msg = self._notification_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            # Respect mute/paused — re-queue at the head by looping until
+            # the user unmutes. Keep the message; we don't drop it.
+            while ws_server.is_muted() and not self._notification_stop.is_set():
+                time.sleep(0.5)
+            # Never interrupt an in-flight TTS response. Wait until the
+            # speaking flag clears before taking the floor.
+            while self._tts_speaking and not self._notification_stop.is_set():
+                time.sleep(0.1)
+            if self._notification_stop.is_set():
+                return
+            # Also wait out any active calendar worker so we don't step on
+            # a "One moment, Sir" or a calendar read that's mid-flight.
+            while self._calendar_working.is_set() and not self._notification_stop.is_set():
+                time.sleep(0.2)
+            try:
+                # speak_direct uses the existing TTS pipeline and is
+                # already safe to call from a background thread. Serialize
+                # on _llm_lock briefly so we don't collide with an in-
+                # flight LLM-driven TTS chunk generation.
+                with self._llm_lock:
+                    pass  # lock is for LLM callers; acquiring + releasing
+                # is our way of waiting out any LLM generation that's in
+                # progress. speak_direct itself does not need the lock.
+                self.speak_direct(msg)
+                print(f"[Notify] spoke: {msg}", flush=True)
+            except Exception as e:
+                print(f"[Notify] speak error: {e}", flush=True)
+
     # ── System commands ───────────────────────────────────────────────────────
 
     # Spoken folder names → filesystem paths
@@ -707,6 +960,152 @@ class VoiceAssistant:
             ["osascript", "-e", script], capture_output=True, text=True
         )
         return result.stdout.strip()
+
+    # ── Browser control ──────────────────────────────────────────────────────
+
+    _BROWSER_WHERE_PATTERNS = (
+        r"\bwhat\s+page\s+am\s+i\s+on\b",
+        r"\bwhat\s+site\s+is\s+this\b",
+        r"\bwhere\s+am\s+i\b",
+        r"\bwhat(?:'?s|\s+is)\s+open\s+in\s+(?:my\s+)?browser\b",
+        r"\bwhat(?:'?s|\s+is)\s+(?:my\s+)?browser\s+(?:on|showing)\b",
+    )
+
+    def _brave_is_frontmost(self) -> bool:
+        """True if Brave Browser is currently the frontmost app."""
+        try:
+            return browser_control._is_brave_frontmost()
+        except Exception:
+            return False
+
+    def _handle_browser_command(self, t: str) -> Optional[str]:
+        """If `t` (already lowercased) is a browser command, execute it and
+        return the spoken response. Otherwise return None.
+
+        Ambiguous commands like 'go back' and 'scroll' only fire when Brave
+        is the frontmost app, so non-browser uses of the same phrase
+        (music 'go back', generic scrolling elsewhere) still work.
+        """
+        # ── Where am I / what page is this ────────────────────────────────
+        for pat in self._BROWSER_WHERE_PATTERNS:
+            if re.search(pat, t):
+                try:
+                    title = browser_control.get_current_title()
+                    url = browser_control.get_current_url()
+                except Exception as e:
+                    return f"I couldn't read Brave's current page, Sir. ({e})"
+                if not title and not url:
+                    return "Brave doesn't seem to have a page open right now, Sir."
+                if title and url:
+                    return f"You're on {title}. The URL is {url}, Sir."
+                return f"You're on {title or url}, Sir."
+
+        # ── New tab ───────────────────────────────────────────────────────
+        if re.search(r"\b(?:open\s+(?:a\s+)?new\s+tab|new\s+tab)\b", t):
+            try:
+                browser_control.new_tab()
+                return "Opened a new tab, Sir."
+            except Exception as e:
+                return f"I couldn't open a new tab, Sir. ({e})"
+
+        # ── Close tab ─────────────────────────────────────────────────────
+        if re.search(r"\bclose\s+(?:this|the|current)\s+tab\b", t):
+            try:
+                browser_control.close_tab()
+                return "Closed the tab, Sir."
+            except Exception as e:
+                return f"I couldn't close the tab, Sir. ({e})"
+
+        # ── Back / forward (only when Brave is frontmost) ────────────────
+        if re.search(r"\b(?:go\s+forward|forward)\b", t) and self._brave_is_frontmost():
+            try:
+                browser_control.go_forward()
+                return "Going forward, Sir."
+            except Exception as e:
+                return f"I couldn't navigate forward, Sir. ({e})"
+
+        if re.search(r"\b(?:go\s+back|back)\b", t) and self._brave_is_frontmost():
+            try:
+                browser_control.go_back()
+                return "Going back, Sir."
+            except Exception as e:
+                return f"I couldn't navigate back, Sir. ({e})"
+
+        # ── Scroll ────────────────────────────────────────────────────────
+        if re.search(r"\b(?:scroll\s+down|go\s+down|page\s+down)\b", t) and self._brave_is_frontmost():
+            try:
+                browser_control.scroll_down()
+                return "Scrolling down, Sir."
+            except Exception as e:
+                return f"I couldn't scroll, Sir. ({e})"
+
+        if re.search(r"\b(?:scroll\s+up|go\s+up|page\s+up)\b", t) and self._brave_is_frontmost():
+            try:
+                browser_control.scroll_up()
+                return "Scrolling up, Sir."
+            except Exception as e:
+                return f"I couldn't scroll, Sir. ({e})"
+
+        # ── Navigate / open / search ──────────────────────────────────────
+        # "search for <query>" always means Google search in the browser.
+        m_search = re.search(r"\bsearch\s+(?:for\s+|the\s+web\s+for\s+)(.+)$", t)
+        if m_search:
+            query = m_search.group(1).strip().rstrip(".?!,")
+            if query:
+                url = browser_control.resolve_spoken_url(query)
+                try:
+                    browser_control.open_url(url)
+                    return f"Searching the web for {query}, Sir."
+                except Exception as e:
+                    return f"I couldn't open Brave, Sir. ({e})"
+
+        # "go to X" / "navigate to X" / "take me to X" / "pull up X"
+        m_goto = re.search(
+            r"\b(?:go\s+to|navigate\s+to|take\s+me\s+to|pull\s+up|bring\s+up)\s+(.+)$",
+            t,
+        )
+        if m_goto:
+            site = m_goto.group(1).strip().rstrip(".?!,")
+            if site:
+                url = browser_control.resolve_spoken_url(site)
+                try:
+                    browser_control.open_url(url)
+                    return self._browser_open_confirmation(site, url)
+                except Exception as e:
+                    return f"I couldn't open Brave, Sir. ({e})"
+
+        # "open <site>" — but only if <site> is a known site name or looks
+        # like a URL/domain. Otherwise let the app-launch path handle it.
+        m_open = re.search(r"^open\s+(.+?)\s*$", t)
+        if m_open:
+            target = m_open.group(1).strip().rstrip(".?!,")
+            t_lower = target.lower()
+            looks_like_url = (
+                t_lower in _BROWSER_KNOWN_SITE_KEYS
+                or t_lower.startswith("http://")
+                or t_lower.startswith("https://")
+                or (
+                    "." in t_lower
+                    and " " not in t_lower
+                    and "/" not in t_lower
+                )
+            )
+            if looks_like_url:
+                url = browser_control.resolve_spoken_url(target)
+                try:
+                    browser_control.open_url(url)
+                    return self._browser_open_confirmation(target, url)
+                except Exception as e:
+                    return f"I couldn't open Brave, Sir. ({e})"
+
+        return None
+
+    def _browser_open_confirmation(self, spoken_site: str, url: str) -> str:
+        """Pick a natural confirmation for an open/navigate command."""
+        if "google.com/search" in url:
+            return f"Searching Google for {spoken_site}, Sir."
+        nice = spoken_site.strip().title()
+        return f"Opening {nice} in Brave, Sir."
 
     # ── Clipboard helpers ─────────────────────────────────────────────────────
 
@@ -1192,6 +1591,14 @@ class VoiceAssistant:
             encoded  = urllib.parse.quote(raw_dest)
             subprocess.run(["open", f"maps://?daddr={encoded}"], check=False)
             return f"Opening Maps with directions to {raw_dest}, Sir."
+
+        # ── Browser control (Brave) ──────────────────────────────────────────
+        # Checked BEFORE the Finder-folder and app-launch blocks so commands
+        # like "open google", "go to youtube", "new tab" route to Brave
+        # instead of being intercepted as generic app/folder commands.
+        browser_resp = self._handle_browser_command(t)
+        if browser_resp is not None:
+            return browser_resp
 
         # ── Finder folders ────────────────────────────────────────────────────
         if re.match(r"^open\s+", t):
@@ -3654,6 +4061,10 @@ class VoiceAssistant:
         print("═" * 58 + "\n")
 
         self._init_wake_word()
+        # Feature 7: start background notification monitor (timers already
+        # speak via _timer_callback; this adds calendar + reminder due
+        # notifications).
+        self.start_notification_monitor()
         if STARTUP_MODE == "conversation":
             self._in_conversation = True
             self._start_conversation_timer()
