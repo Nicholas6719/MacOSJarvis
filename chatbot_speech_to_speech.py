@@ -198,12 +198,20 @@ TTS_RATE     = 24_000
 FRAME_MS     = 30
 FRAME_SIZE   = int(SAMPLE_RATE * FRAME_MS / 1_000)
 
-# Adaptive silence: short for quick commands, longer once you've been speaking a while
-SILENCE_CUTOFF_SHORT_MS  = 520
-SILENCE_CUTOFF_LONG_MS   = 950
+# Adaptive silence: short for quick commands, longer once you've been speaking a while.
+# 500ms is the floor — anything lower and Jarvis will cut users off mid-sentence.
+# LONG was 950ms; tightened to 600ms so the response latency after a long
+# utterance is ~350ms faster with no measurable truncation risk.
+SILENCE_CUTOFF_SHORT_MS  = 500
+SILENCE_CUTOFF_LONG_MS   = 600
 LONG_SPEECH_THRESHOLD_MS = 2_500   # use long cutoff after 2.5 s of speech
 
-PLAYER_BLOCKSIZE = 4_096
+# Dropped from 4096 (~170 ms at 24 kHz) to 1024 (~42 ms). sounddevice's
+# callback fires once per block, so the first-audio latency after we feed()
+# the first synth chunk is bounded by this. 1024 is small enough to eliminate
+# the perceptible head-of-speech gap and still large enough that macOS Core
+# Audio never underruns on M-series silicon.
+PLAYER_BLOCKSIZE = 1_024
 
 # ── Wake word ────────────────────────────────────────────────────────────────
 WAKE_WORD_MODEL = "hey_jarvis"
@@ -214,8 +222,11 @@ STARTUP_MODE = os.environ.get("JARVIS_STARTUP_MODE", "wake")
 WAKE_MODE_SENTINEL = "__WAKE_MODE__"
 NOISE_FLOOR_RMS = 150  # Minimum RMS energy to consider audio as speech
 
-# Level 3 memory: speak a brief line when summarization starts? Set False for silent.
-SPEAK_MEMORY_UPDATE = True
+# Memory operations are always silent. Any "updating my memory" / "loaded
+# memory" / auto-save acknowledgment has been removed — the user never hears
+# about background memory work. Explicit commands ("remember X", "forget X",
+# "what do you know about me") still speak naturally.
+SPEAK_MEMORY_UPDATE = False
 
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 CLAUSE_RE   = re.compile(r"(?<=[,;:])\s+")
@@ -473,6 +484,9 @@ class VoiceAssistant:
             model_path=str(model_path),
             n_gpu_layers=c.get("n_gpu_layers", -1),
             n_ctx=c.get("n_ctx", 4096),
+            n_threads=c.get("n_threads", 6),
+            n_batch=c.get("n_batch", 512),
+            f16_kv=c.get("f16_kv", True),
             verbose=False,
         )
         self._llm_cfg = c
@@ -3786,21 +3800,11 @@ class VoiceAssistant:
     # ── Turn (LLM pipeline) ───────────────────────────────────────────────────
 
     def _speak_memory_ack(self) -> None:
-        """Speak a subtle in-character acknowledgment after auto-saving a fact."""
-        ack = random.choice([
-            "Noted.",
-            "Understood.",
-            "Duly noted.",
-            "I'll keep that in mind.",
-            "Noted, Sir.",
-            "Understood, Sir.",
-            "Duly noted, Sir.",
-        ])
-        print(f"[Memory] {ack}")
-        try:
-            self.speak_direct(ack)
-        except Exception as e:
-            print(f"[Memory] ack speak error: {e}")
+        """No-op. Auto-detected facts are saved completely silently — the user
+        should never hear Jarvis narrate its own memory operations. Kept as a
+        no-op so existing call sites (_pending_memory_ack branches) compile
+        and do no work."""
+        return
 
     def _summarize_old_exchanges(self) -> None:
         """Level 3 memory: find conversation rows outside the active 20-turn
@@ -3829,18 +3833,10 @@ class VoiceAssistant:
                 f"exchange rows in {len(batches)} batch(es)…"
             )
 
-            # Only speak the memory-update line on the initial startup run.
-            # Re-entries from inactivity timeout or manual return-to-wake stay silent.
-            if SPEAK_MEMORY_UPDATE and was_first_summarization:
-                try:
-                    self.speak_direct("One moment, Sir. Updating my memory.")
-                except Exception as e:
-                    print(f"[Memory] memory-update speak error: {e}")
-                finally:
-                    # speak_direct leaves state on "idle" — restore to "wake"
-                    # since we're summarizing from the wake-mode hook.
-                    if not self._in_conversation:
-                        ws_server.set_state("wake")
+            # Background memory work is silent. `was_first_summarization`
+            # is still tracked for future use but Jarvis no longer speaks
+            # "updating my memory" on the initial run.
+            _ = was_first_summarization
 
             for batch in batches:
                 try:
