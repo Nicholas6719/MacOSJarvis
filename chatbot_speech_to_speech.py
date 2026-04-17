@@ -1580,6 +1580,73 @@ class VoiceAssistant:
             print(f"[Calendar] JSON parse error: {e}  — raw: {raw!r}")
             return None
 
+    def _extract_update_json(self, utterance: str) -> Optional[dict]:
+        """LLM extraction prompt specifically for UPDATE operations.
+
+        The `_extract_event_json` prompt treats every field as a new value
+        to create an event from. That breaks for updates: when Nicholas
+        says 'reschedule the GPT subscription reminder to Sunday at 9 AM',
+        the general extractor sees 'GPT subscription reminder' and writes
+        it back as the new title instead of leaving title alone. This
+        prompt is explicit: only extract fields the user actually wants
+        to CHANGE, never their identifier for finding the existing item."""
+        today_date = datetime.date.today()
+        today_iso = today_date.isoformat()
+        today_name = today_date.strftime("%A")
+        prompt = (
+            "The user wants to UPDATE an existing reminder or event. "
+            "Extract ONLY the NEW field values they want to set — fields "
+            "that should change. Fields the user is using to IDENTIFY the "
+            "existing item (its current title or partial name) must NOT "
+            "appear in your output.\n\n"
+            "Respond in JSON only — no explanation, no markdown. Use JSON "
+            "null (not the string 'null') for any field NOT being changed.\n\n"
+            "Fields:\n"
+            "- new_title: ONLY if the user explicitly asked to rename the "
+            "item (e.g. 'rename X to Y', 'change the name to Z'). If they "
+            "used the old name just to identify the item — e.g. 'reschedule "
+            "the GPT reminder' — leave this null. Default: null.\n"
+            "- new_date: YYYY-MM-DD or a weekday name (monday, tuesday, etc.) "
+            "or 'today'/'tomorrow' — ONLY if the user is rescheduling. Default: null.\n"
+            "- new_time: HH:MM in 24-hour format — ONLY if the user specified "
+            "a new time (e.g. 'at 9 AM', 'at 6 PM'). Default: null.\n"
+            "- new_notes: new notes content — ONLY if the user is changing notes. "
+            "Default: null.\n\n"
+            "Examples:\n"
+            "  'reschedule the grocery reminder to tomorrow at 6 PM' -> "
+            "{\"new_title\": null, \"new_date\": \"tomorrow\", "
+            "\"new_time\": \"18:00\", \"new_notes\": null}\n"
+            "  'move the GPT subscription reminder to Sunday at 9 AM' -> "
+            "{\"new_title\": null, \"new_date\": \"sunday\", "
+            "\"new_time\": \"09:00\", \"new_notes\": null}\n"
+            "  'rename the groceries reminder to weekly shopping' -> "
+            "{\"new_title\": \"weekly shopping\", \"new_date\": null, "
+            "\"new_time\": null, \"new_notes\": null}\n"
+            "  'change the stock market reminder title to investing' -> "
+            "{\"new_title\": \"investing\", \"new_date\": null, "
+            "\"new_time\": null, \"new_notes\": null}\n\n"
+            f"Today is {today_iso} ({today_name}). "
+            f"User said: '{utterance}'"
+        )
+        raw = self._llm_silent(
+            "You are a precise JSON extraction tool. Reply with valid JSON only.",
+            prompt,
+            max_tokens=180,
+            temperature=0.1,
+        )
+        if not raw:
+            return None
+        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+        raw = re.sub(r"\s*```\s*$", "", raw).strip()
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if m:
+            raw = m.group(0)
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            print(f"[Calendar] update-JSON parse error: {e}  — raw: {raw!r}")
+            return None
+
     def _resolve_relative_date(self, date_str: Optional[str]) -> datetime.date:
         """Resolve today/tomorrow/ISO/<weekday> to an actual date."""
         today = datetime.date.today()
@@ -2185,8 +2252,9 @@ class VoiceAssistant:
 
     def _cal_update_reminder(self, user_input: str) -> None:
         """Update a reminder's title, due date/time, or notes via voice.
-        Extracts new values from the utterance via the LLM, then applies
-        them to the best-matching open reminder."""
+        Uses the dedicated `_extract_update_json` prompt (NOT the general
+        event extractor) so the user's identifier for the reminder doesn't
+        get mistakenly interpreted as a new title."""
         hint = self._extract_target_hint(user_input)
         if not hint:
             self._safe_speak(
@@ -2194,30 +2262,53 @@ class VoiceAssistant:
             )
             return
 
-        # Reuse the event-extraction LLM to pull new field values out of the
-        # user's request. Not every field has to be present — we only apply
-        # the ones that came back non-null.
-        data_json = self._extract_event_json(user_input) or {}
-        new_title = None
-        raw_title = data_json.get("title")
-        # Only use the extracted title if it's clearly different from our
-        # fuzzy-hint (which is the OLD title). Otherwise the LLM probably
-        # just echoed the hint back.
-        if isinstance(raw_title, str) and raw_title.strip() and \
-           raw_title.strip().lower() != hint.lower():
-            new_title = raw_title.strip()
+        data_json = self._extract_update_json(user_input) or {}
 
+        # Sanitize string fields — LLM sometimes returns "null" string
+        def _clean_optional(value):
+            if value is None:
+                return None
+            s = str(value).strip()
+            if s.lower() in ("null", "none", "n/a", "na", "nil", ""):
+                return None
+            return s
+
+        new_title = _clean_optional(data_json.get("new_title"))
+        new_date_field = _clean_optional(data_json.get("new_date"))
+        new_time_field = _clean_optional(data_json.get("new_time"))
+        new_notes = _clean_optional(data_json.get("new_notes"))
+
+        # Safety net: if the LLM disobeyed and put the hint into new_title,
+        # reject it. An exact-lower-case match with the identifier is never
+        # a real rename.
+        if new_title and new_title.lower().strip() == hint.lower().strip():
+            new_title = None
+
+        # Build the new due datetime. The user might change date only,
+        # time only, or both. If they change only one, keep the other
+        # from the existing reminder if possible — but we don't have
+        # easy access to the existing reminder's fields from here, so
+        # we use current date as fallback for missing time, and current
+        # time as fallback for missing date.
         new_due: Optional[datetime.datetime] = None
-        date_field = data_json.get("date")
-        start_time = data_json.get("start_time")
-        if date_field or start_time:
-            resolved = self._resolve_relative_date(str(date_field or "today"))
-            st = self._parse_time(start_time) or (9, 0)
+        if new_date_field or new_time_field:
+            if new_date_field:
+                resolved_date = self._resolve_relative_date(new_date_field)
+            else:
+                resolved_date = datetime.date.today()
+            parsed_time = self._parse_time(new_time_field)
+            if parsed_time is None and new_time_field is None:
+                # No time specified and no date specified — can't happen
+                # because the outer if guarantees one of them exists.
+                parsed_time = (9, 0)
+            elif parsed_time is None:
+                # Date-only reschedule — default to 9:00 AM.
+                parsed_time = (9, 0)
             new_due = datetime.datetime.combine(
-                resolved, datetime.time(st[0], st[1])
+                resolved_date, datetime.time(parsed_time[0], parsed_time[1])
             )
 
-        if new_title is None and new_due is None:
+        if new_title is None and new_due is None and new_notes is None:
             self._safe_speak(
                 "I heard you wanted to update a reminder, Sir, but I "
                 "didn't catch what to change. Try saying for example, "
@@ -2226,7 +2317,7 @@ class VoiceAssistant:
             return
 
         success, msg = calendar_reminders.update_reminder(
-            hint, new_title=new_title, new_due=new_due
+            hint, new_title=new_title, new_due=new_due, new_notes=new_notes,
         )
         if not success:
             self._safe_speak(
@@ -2240,6 +2331,8 @@ class VoiceAssistant:
         if new_due:
             when = calendar_reminders.format_datetime_for_speech(new_due)
             parts.append(f"— due {when}")
+        if new_notes:
+            parts.append("— notes updated")
         self._safe_speak(" ".join(parts) + ", Sir.")
 
     def _cal_delete_event(self, user_input: str) -> None:
