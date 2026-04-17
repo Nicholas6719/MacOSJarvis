@@ -165,6 +165,22 @@ def _run_osa(script: str, timeout: int = _DEFAULT_TIMEOUT_S) -> str:
     return (result.stdout or "").strip()
 
 
+def format_time_for_speech(dt: datetime.datetime) -> str:
+    """Format just the time portion for TTS. Drops ':00' when minutes are
+    zero so Jarvis says '7 PM' instead of '7:00 PM'."""
+    if dt.minute == 0:
+        return dt.strftime("%-I %p")
+    return dt.strftime("%-I:%M %p")
+
+
+def format_datetime_for_speech(dt: datetime.datetime) -> str:
+    """Format a full day + time for TTS. Drops ':00' when minutes are
+    zero — 'Saturday, April 18 at 7 PM' vs 'Saturday, April 18 at 6:30 PM'."""
+    if dt.minute == 0:
+        return dt.strftime("%A, %B %-d at %-I %p")
+    return dt.strftime("%A, %B %-d at %-I:%M %p")
+
+
 def _escape(s: Optional[str]) -> str:
     """Escape a Python string for safe embedding inside an AppleScript
     double-quoted literal."""
@@ -373,9 +389,9 @@ def _get_reminders_via_eventkit() -> list:
                         h if (h is not None and h >= 0) else 0,
                         mi if (mi is not None and mi >= 0) else 0,
                     )
-                    # Format the same way AppleScript does:
-                    # "Saturday, April 18, 2026 at 10:30:00 AM"
-                    due_str = due_dt.strftime("%A, %B %-d, %Y at %-I:%M:%S %p")
+                    # Format for speech. Drops ":00" when minutes are zero
+                    # so Jarvis says "7 PM" instead of "7:00 PM".
+                    due_str = format_datetime_for_speech(due_dt)
         except Exception:
             pass
 

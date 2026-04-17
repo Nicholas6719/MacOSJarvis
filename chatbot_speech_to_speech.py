@@ -938,7 +938,8 @@ class VoiceAssistant:
 
         # ── Date & time ───────────────────────────────────────────────────────
         if re.search(r"\b(?:what(?:'s|\s+is)\s+(?:the\s+)?(?:current\s+)?time|what\s+time\s+is\s+it|time\s+please|tell\s+me\s+the\s+time)\b", t):
-            now = datetime.datetime.now().strftime("%-I:%M %p")
+            # Use the speech-formatter so "7:00 PM" is spoken as "7 PM".
+            now = calendar_reminders.format_time_for_speech(datetime.datetime.now())
             return f"It's {now}, Sir."
 
         if re.search(r"\b(?:what(?:'s|\s+is)\s+(?:today'?s?\s+)?date|what(?:'s|\s+is)\s+today|today'?s?\s+date)\b", t):
@@ -1978,8 +1979,10 @@ class VoiceAssistant:
         # the LLM path because it skips the generation step entirely —
         # template text goes straight to TTS. See NATURAL_CALENDAR_CONFIRMATIONS
         # at the top of the file to switch back to the LLM path.
-        when = start_dt.strftime("%A, %B %-d at %-I:%M %p")
-        end_str = end_dt.strftime("%-I:%M %p")
+        # format_datetime_for_speech / format_time_for_speech drop ":00"
+        # when minutes are zero so Jarvis says "7 PM" not "7:00 PM".
+        when = calendar_reminders.format_datetime_for_speech(start_dt)
+        end_str = calendar_reminders.format_time_for_speech(end_dt)
         loc_phrase = f" at {data['location']}" if data.get("location") else ""
 
         if NATURAL_CALENDAR_CONFIRMATIONS:
@@ -2057,7 +2060,7 @@ class VoiceAssistant:
 
         if NATURAL_CALENDAR_CONFIRMATIONS:
             if due_dt:
-                when = due_dt.strftime("%A, %B %-d at %-I:%M %p")
+                when = calendar_reminders.format_datetime_for_speech(due_dt)
                 action_desc = f"Created a reminder '{title}' due {when}."
             else:
                 action_desc = f"Created a reminder '{title}' with no specific due date."
@@ -2076,7 +2079,7 @@ class VoiceAssistant:
 
         # Fast template path.
         if due_dt:
-            when = due_dt.strftime("%A, %B %-d at %-I:%M %p")
+            when = calendar_reminders.format_datetime_for_speech(due_dt)
             text = f"Done, Sir. Reminder set: {title}, due {when}."
         else:
             text = f"Done, Sir. I've added a reminder to {title}."
