@@ -9,6 +9,7 @@ Uses only Python's built-in sqlite3 — no new dependencies.
 """
 
 import calendar
+import os
 import sqlite3
 import datetime
 import json as _json
@@ -16,7 +17,14 @@ import re
 import time
 from pathlib import Path
 
-DB_PATH = Path("/Users/nicholascoppola/Documents/Coding_Projects/Jarvis/jarvis_memory.db")
+# Prefer JARVIS_DATA_DIR (set by the macOS app) so DB survives app updates.
+# Local-dev fallback: alongside this module. Never hardcode the home directory.
+_data_dir_env = os.environ.get("JARVIS_DATA_DIR")
+DB_PATH = (
+    Path(_data_dir_env) / "jarvis_memory.db"
+    if _data_dir_env
+    else Path(__file__).resolve().parent / "jarvis_memory.db"
+)
 
 _REMEMBER_TRIGGERS = (
     "remember that",

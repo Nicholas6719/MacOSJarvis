@@ -12,6 +12,7 @@ System cmds: volume, apps, screenshot, timer — executed locally, no LLM
 import collections
 import datetime
 import json
+import logging
 import os
 import queue
 import random
@@ -20,6 +21,8 @@ import subprocess
 import sys
 import threading
 import time
+
+logger = logging.getLogger("jarvis")
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -674,10 +677,13 @@ class VoiceAssistant:
             temperature=0,                      # deterministic, no random sampling
             condition_on_previous_text=False,   # no hallucination from prior context
             vad_filter=True,
-            vad_parameters={
-                "min_silence_duration_ms": 300,
-                "speech_pad_ms": 400,           # keep a bit of audio around speech edges
-            },
+            vad_parameters={"threshold": 0.45, "min_silence_duration_ms": 500},
+            initial_prompt=(
+                "Jarvis, hey Jarvis, yes, no, remind me, remember, calendar, "
+                "schedule, tomorrow, today, desktop, downloads, documents, "
+                "move, rename, find, open, close, browser, timer, screenshot, "
+                "what's on my screen, battery, volume, brightness, music"
+            ),
         )
         return " ".join(s.text.strip() for s in segments).strip()
 
@@ -744,9 +750,12 @@ class VoiceAssistant:
     def _notification_monitor_loop(self) -> None:
         """Poll Calendar and Reminders on a fixed cadence. Any hits are
         pushed onto _notification_queue for the speaker thread to drain."""
-        # Small startup delay so we don't collide with the first wake-word
-        # load and the initial calendar cold-launch.
-        for _ in range(20):
+        # 90-second startup delay. The monitor thread is registered and
+        # running, but we do NOT touch Calendar/Reminders AppleScript
+        # during startup — that was waking Calendar.app and Reminders.app
+        # unnecessarily every launch. After this delay, polling resumes
+        # at the normal 60-second cadence.
+        for _ in range(900):
             if self._notification_stop.is_set():
                 return
             time.sleep(0.1)
@@ -755,11 +764,11 @@ class VoiceAssistant:
             try:
                 self._check_calendar_notifications()
             except Exception as e:
-                print(f"[Notify] calendar check error: {e}", flush=True)
+                logger.error(f"[Notify] _check_calendar_notifications error: {e}")
             try:
                 self._check_reminder_notifications()
             except Exception as e:
-                print(f"[Notify] reminder check error: {e}", flush=True)
+                logger.error(f"[Notify] _check_reminder_notifications error: {e}")
             # Sleep in small chunks so stop requests are responsive.
             for _ in range(_NOTIFICATION_POLL_INTERVAL_S * 10):
                 if self._notification_stop.is_set():
@@ -770,7 +779,7 @@ class VoiceAssistant:
         try:
             events = calendar_reminders.get_today_events()
         except Exception as e:
-            print(f"[Notify] get_today_events failed: {e}", flush=True)
+            logger.error(f"[Notify] get_today_events failed: {e}")
             return
         now = datetime.datetime.now()
         for ev in events:
@@ -787,7 +796,7 @@ class VoiceAssistant:
         try:
             reminders = calendar_reminders.get_all_reminders()
         except Exception as e:
-            print(f"[Notify] get_all_reminders failed: {e}", flush=True)
+            logger.error(f"[Notify] get_all_reminders failed: {e}")
             return
         now = datetime.datetime.now()
         for r in reminders:
@@ -835,7 +844,7 @@ class VoiceAssistant:
                 self.speak_direct(msg)
                 print(f"[Notify] spoke: {msg}", flush=True)
             except Exception as e:
-                print(f"[Notify] speak error: {e}", flush=True)
+                logger.error(f"[Notify] _notification_speaker_loop speak error: {e}")
 
     # ── System commands ───────────────────────────────────────────────────────
 
@@ -962,9 +971,17 @@ class VoiceAssistant:
         )
 
     def _applescript(self, script: str) -> str:
-        result = subprocess.run(
-            ["osascript", "-e", script], capture_output=True, text=True
-        )
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=10,
+            )
+        except subprocess.TimeoutExpired as e:
+            logger.error(f"_applescript timeout after 10s: {e}")
+            return ""
+        except Exception as e:
+            logger.error(f"_applescript subprocess error: {e}")
+            return ""
         return result.stdout.strip()
 
     # ── Browser control ──────────────────────────────────────────────────────
@@ -1132,7 +1149,7 @@ class VoiceAssistant:
         subprocess.run(
             ["osascript", "-e",
              f'display notification "Timer complete!" with title "Jarvis" subtitle "{label}"'],
-            check=False,
+            check=False, timeout=10,
         )
         # Drain the audio queue so the mic doesn't pick up the notification sound
         time.sleep(0.3)
@@ -1369,7 +1386,7 @@ class VoiceAssistant:
             subprocess.run([
                 "osascript", "-e",
                 'tell application "System Events" to keystroke "q" using {command down, control down}',
-            ], check=False)
+            ], check=False, timeout=10)
             return "Locking your Mac, Sir."
 
         # ── System info ───────────────────────────────────────────────────────
@@ -2226,23 +2243,23 @@ class VoiceAssistant:
                 print(f"[Calendar] unknown intent: {intent!r}")
         except RuntimeError as e:
             # Known failure from calendar_reminders (timeout, permission, etc.)
-            print(f"[Calendar] AppleScript error: {e}")
+            logger.error(f"[Calendar] AppleScript error in intent={intent!r}: {e}")
+            self._pending_calendar_action = None
             self._safe_speak(
                 "I wasn't able to access your calendar, Sir — "
                 "you may need to grant permission in System Settings."
             )
         except Exception as e:
-            print(f"[Calendar] worker error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"[Calendar] worker error in intent={intent!r}: {e}")
+            self._pending_calendar_action = None
             self._safe_speak(
-                "I ran into a problem handling that calendar request, Sir."
+                "Something went wrong with that calendar request, Sir — want to try again?"
             )
         finally:
-            # Defensive: if the worker crashed mid-flight, clear any pending
-            # clarification so the next utterance isn't silently swallowed.
-            if self._pending_calendar_action is None:
-                pass  # nothing to clean up
+            # Belt-and-suspenders: if the worker crashed mid-flight before
+            # speaking a clarifying question, the except branches above have
+            # already cleared _pending_calendar_action. Always release the
+            # worker flag so the main loop resumes.
             self._calendar_working.clear()
             # The last speak_direct call inside the handler already set
             # state=idle and restarted the timer (if still in conversation).
@@ -3001,11 +3018,12 @@ class VoiceAssistant:
             try:
                 self._finalize_create_event(data)
             except Exception as e:
-                print(f"[Calendar] resume finalize error: {e}")
+                logger.exception(f"[Calendar] resume finalize error: {e}")
                 self._safe_speak(
-                    "I wasn't able to finish creating that event, Sir."
+                    "Something went wrong finishing that event, Sir — want to try again?"
                 )
             finally:
+                self._pending_calendar_action = None
                 self._calendar_working.clear()
                 try:
                     ws_server.set_state("idle")
@@ -3334,23 +3352,23 @@ class VoiceAssistant:
             "going TO — the TARGET. It is the place named after 'to', "
             "'into', 'onto', 'on', or 'in'. It is NEVER the place named "
             "after 'from' — that is the source, which you must ignore. "
-            "Resolve spoken locations to absolute paths: "
-            "Desktop -> /Users/nicholascoppola/Desktop, "
-            "Documents -> /Users/nicholascoppola/Documents, "
-            "Downloads -> /Users/nicholascoppola/Downloads, "
-            "Pictures -> /Users/nicholascoppola/Pictures, "
-            "Music -> /Users/nicholascoppola/Music. "
+            f"Resolve spoken locations to absolute paths: "
+            f"Desktop -> {os.path.expanduser('~/Desktop')}, "
+            f"Documents -> {os.path.expanduser('~/Documents')}, "
+            f"Downloads -> {os.path.expanduser('~/Downloads')}, "
+            f"Pictures -> {os.path.expanduser('~/Pictures')}, "
+            f"Music -> {os.path.expanduser('~/Music')}. "
             "For anything that isn't a move, set this to null.\n"
             "- new_name: string OR null. Only set when the user is "
             "renaming the file; otherwise null.\n\n"
             "Examples:\n"
             "  'move the rmv file from my desktop to my documents folder' -> "
             "{\"query\": \"rmv\", \"action\": \"move\", "
-            "\"destination\": \"/Users/nicholascoppola/Documents\", "
+            f"\"destination\": \"{os.path.expanduser('~/Documents')}\", "
             "\"new_name\": null}\n"
             "  'move the rmv file from my downloads folder into the documents folder' -> "
             "{\"query\": \"rmv\", \"action\": \"move\", "
-            "\"destination\": \"/Users/nicholascoppola/Documents\", "
+            f"\"destination\": \"{os.path.expanduser('~/Documents')}\", "
             "\"new_name\": null}\n"
             "  'rename the groceries file to shopping list' -> "
             "{\"query\": \"groceries\", \"action\": \"rename\", "
@@ -3530,11 +3548,12 @@ class VoiceAssistant:
                 new_name=new_name,
             )
         except Exception as e:
-            print(f"[File] handle command error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"[File] handle command error: {e}")
+            # Clear pending state on error so Jarvis isn't stuck waiting
+            # for a confirmation to a question that never got asked.
+            self._pending_file_action = None
             self._safe_speak(
-                "I ran into a problem handling that file request, Sir."
+                "Something went wrong with that file request, Sir — want to try again?"
             )
 
     def _handle_file_find(self, matches: list[str]) -> None:
@@ -3879,7 +3898,7 @@ class VoiceAssistant:
                         f"{summary_text[:80]}{'…' if len(summary_text) > 80 else ''}"
                     )
                 except Exception as e:
-                    print(f"[Memory] batch summarize error: {e}")
+                    logger.error(f"[Memory] _summarize_old_exchanges batch error: {e}")
                     continue
 
             # Refresh the system prompt so new summaries are used immediately.
@@ -3892,7 +3911,7 @@ class VoiceAssistant:
             memory.cleanup_summarized_exchanges()
             self._run_meta_summarization()
         except Exception as e:
-            print(f"[Memory] Summarization error: {e}")
+            logger.exception(f"[Memory] _summarize_old_exchanges error: {e}")
         finally:
             self._summarizing = False
             # Safety net: if we ran from the wake-mode hook, make sure the UI
@@ -3985,7 +4004,7 @@ class VoiceAssistant:
             # Rebuild once more so the fresh meta-summary is in effect immediately.
             self._rebuild_system_prompt()
         except Exception as e:
-            print(f"[Memory] Meta-summarization error: {e}")
+            logger.exception(f"[Memory] _run_meta_summarization error: {e}")
 
     def _rebuild_system_prompt(self) -> None:
         """Rebuild the system prompt from the base prompt + current memory facts
@@ -4243,14 +4262,14 @@ class VoiceAssistant:
                             subprocess.run(
                                 ["osascript", "-e",
                                  'tell application "System Events" to shut down'],
-                                check=False
+                                check=False, timeout=10,
                             )
                         elif action == "restart":
                             self.speak_direct("Restarting your Mac now.")
                             subprocess.run(
                                 ["osascript", "-e",
                                  'tell application "System Events" to restart'],
-                                check=False
+                                check=False, timeout=10,
                             )
                         elif action == "sleep":
                             self.speak_direct("Putting your Mac to sleep.")
@@ -4536,6 +4555,12 @@ class VoiceAssistant:
 
 
 if __name__ == "__main__":
+    # Configure logging so background-thread errors (notification monitor,
+    # memory summarization, calendar/file workers) surface in the logs.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
     # Start HTTP/WebSocket servers first — before heavy ML imports in VoiceAssistant.
     ws_server.start()
     assistant = VoiceAssistant()
