@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import WebKit
 import AVFoundation
+import EventKit
 
 // MARK: - Animated menubar waveform icon
 
@@ -234,6 +235,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        // Request Calendar + Reminders BEFORE starting the Python subprocess,
+        // so by the time Python's AppleScript subprocess touches Calendar the
+        // permission dialog has been shown and macOS knows which bundle to
+        // attribute the request to (com.mdanyl.jarvisapp). Without these
+        // EventKit calls, macOS never prompts for Full Access — AppleScript
+        // from a deeply-nested subprocess doesn't reliably trigger the
+        // permission dialog on macOS 14+, which is why reads were returning
+        // empty even after the Info.plist keys were added.
+        requestCalendarAndRemindersAccess()
         setupMenubar()
         setupOrbWindow()
         backendManager.start()
@@ -567,5 +577,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func requestMicrophonePermission() {
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
+    }
+
+    // MARK: - Calendar + Reminders
+
+    /// Requests Full Access to Calendar and Reminders at app launch.
+    ///
+    /// The Info.plist keys (`NSCalendarsFullAccessUsageDescription`,
+    /// `NSRemindersFullAccessUsageDescription`) only determine the STRING
+    /// shown in the permission dialog. They do NOT cause macOS to show
+    /// the dialog on their own. The dialog is triggered by an actual
+    /// EventKit call like `requestFullAccessToEvents`.
+    ///
+    /// Previously, Jarvis relied on the Python subprocess running
+    /// `osascript` to trigger the Calendar permission prompt. On macOS 14
+    /// and later, that indirect path either silently granted Write Only
+    /// (create events OK, read events fails) or granted nothing at all,
+    /// depending on how TCC attributed the nested subprocess. By calling
+    /// EventKit here — directly from the bundled GUI app — macOS unambiguously
+    /// attributes the permission to `com.mdanyl.jarvisapp`, and the Python
+    /// subprocess's later osascript calls inherit that attribution.
+    private func requestCalendarAndRemindersAccess() {
+        let store = EKEventStore()
+
+        if #available(macOS 14.0, *) {
+            store.requestFullAccessToEvents { granted, error in
+                print("[JarvisApp] Calendar full access granted=\(granted) error=\(String(describing: error))")
+            }
+            store.requestFullAccessToReminders { granted, error in
+                print("[JarvisApp] Reminders full access granted=\(granted) error=\(String(describing: error))")
+            }
+        } else {
+            // macOS 13 and earlier used a single-tier permission model.
+            store.requestAccess(to: .event) { granted, error in
+                print("[JarvisApp] Calendar access granted=\(granted) error=\(String(describing: error))")
+            }
+            store.requestAccess(to: .reminder) { granted, error in
+                print("[JarvisApp] Reminders access granted=\(granted) error=\(String(describing: error))")
+            }
+        }
     }
 }
