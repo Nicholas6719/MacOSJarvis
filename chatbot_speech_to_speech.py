@@ -2158,8 +2158,18 @@ class VoiceAssistant:
 
         Serialized with self._llm_lock — llama-cpp-python crashes hard
         (SIGSEGV) if two threads hit the same Llama instance concurrently."""
+        t_wait_start = time.monotonic()
         try:
             with self._llm_lock:
+                t_gen_start = time.monotonic()
+                wait_s = t_gen_start - t_wait_start
+                if wait_s > 0.5:
+                    # Long waits mean the lock was held by background
+                    # summarization / a concurrent user worker. Surface
+                    # it so future slowdowns are easy to spot in the log.
+                    logger.warning(
+                        f"_llm_silent waited {wait_s:.2f}s for _llm_lock"
+                    )
                 result = self._llm.create_chat_completion(
                     messages=[
                         {"role": "system", "content": system},
@@ -2171,10 +2181,12 @@ class VoiceAssistant:
                     stop=["<|eot_id|>"],
                     stream=False,
                 )
+                gen_s = time.monotonic() - t_gen_start
+            logger.info(f"_llm_silent generation took {gen_s:.2f}s")
             text = (result["choices"][0]["message"]["content"] or "").strip()
             return _clean(text)
         except Exception as e:
-            print(f"[Calendar] LLM call error: {e}")
+            logger.error(f"_llm_silent error: {e}")
             return ""
 
     # ── Structured extraction ──────────────────────────────────────────────
@@ -4029,6 +4041,18 @@ class VoiceAssistant:
             _ = was_first_summarization
 
             for batch in batches:
+                # Yield to any user activity. If the calendar worker is
+                # running, a conversation is active, or TTS is speaking,
+                # defer the next batch — otherwise this daemon thread
+                # holds _llm_lock for seconds at a time and starves the
+                # foreground path. That's what caused the 90-second
+                # calendar hangs reported after the n_ctx shrink.
+                while (
+                    self._calendar_working.is_set()
+                    or self._in_conversation
+                    or self._tts_speaking
+                ):
+                    time.sleep(0.5)
                 try:
                     conversation_text = "\n".join(
                         f"{row['role'].upper()}: {row['content']}" for row in batch
@@ -4254,7 +4278,16 @@ class VoiceAssistant:
         # crash the process (SIGSEGV / exit code 11).
         buf  = ""
         full = ""
+        t_wait = time.monotonic()
         with self._llm_lock:
+            wait_s = time.monotonic() - t_wait
+            if wait_s > 0.5:
+                logger.warning(
+                    f"stream_sentences waited {wait_s:.2f}s for _llm_lock "
+                    f"(fast={fast})"
+                )
+            t_gen = time.monotonic()
+            first_token_logged = False
             stream = self._llm.create_chat_completion(
                 messages=messages,
                 max_tokens=max_new_tokens,
@@ -4265,6 +4298,12 @@ class VoiceAssistant:
             )
 
             for chunk in stream:
+                if not first_token_logged:
+                    logger.info(
+                        f"stream_sentences first token in "
+                        f"{time.monotonic() - t_gen:.2f}s (fast={fast})"
+                    )
+                    first_token_logged = True
                 delta: str = chunk["choices"][0]["delta"].get("content", "") or ""
                 buf  += delta
                 full += delta

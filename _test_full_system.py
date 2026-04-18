@@ -543,8 +543,11 @@ def _section_llm_cfg(r: Runner) -> None:
     r.test("n_threads == 6", n_threads)
 
     def n_ctx():
-        assert cfg.get("n_ctx") == 2048, f"n_ctx={cfg.get('n_ctx')}"
-    r.test("n_ctx == 2048", n_ctx)
+        # Reverted from the brief 2048 experiment — the system prompt
+        # alone is ~800 tokens and would have forced constant KV
+        # truncation at 2048.
+        assert cfg.get("n_ctx") == 4096, f"n_ctx={cfg.get('n_ctx')}"
+    r.test("n_ctx == 4096", n_ctx)
 
     def n_batch():
         assert cfg.get("n_batch") == 512, f"n_batch={cfg.get('n_batch')}"

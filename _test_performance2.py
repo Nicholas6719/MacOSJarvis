@@ -48,10 +48,16 @@ def test_silence_cutoff_long_in_range():
     assert 700 <= v <= 800, f"SILENCE_CUTOFF_LONG_MS {v} outside 700-800"
 
 
-def test_n_ctx_is_2048():
+def test_n_ctx_is_4096():
+    # Reverted from 2048 back to 4096 — the long `prompt_behavior` block
+    # plus stored facts / summaries / 10 history pairs routinely totals
+    # 1800-2400 input tokens, which forced llama-cpp to truncate the
+    # system prompt on every call and re-prefill the KV cache. That
+    # manifested as extreme slowness and 90s calendar hangs when
+    # _llm_silent queued behind memory-summarization batches.
     cfg = _load_config()
     v = cfg["llm"].get("n_ctx")
-    assert v == 2048, f"n_ctx must be 2048, got {v!r}"
+    assert v == 4096, f"n_ctx must be 4096, got {v!r}"
 
 
 def test_use_mmap_passed_to_llama():
@@ -140,7 +146,7 @@ def test_model_load_timing_logs():
 _TESTS = [
     test_silence_cutoff_short_in_range,
     test_silence_cutoff_long_in_range,
-    test_n_ctx_is_2048,
+    test_n_ctx_is_4096,
     test_use_mmap_passed_to_llama,
     test_history_capped_at_10,
     test_simple_conversational_helpers,
